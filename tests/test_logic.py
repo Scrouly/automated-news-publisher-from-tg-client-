@@ -1,24 +1,27 @@
 """
-Unit-тесты для logic.py.
+Unit-тесты для core/logic.py.
 Запуск: python -m unittest discover -s tests -v
 """
 
+import json
 import os
 import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # ── Фейковые env + заглушки пакетов до импорта logic ─────────────
 os.environ.setdefault("SECRET_TOKEN",   "test_token")
 os.environ.setdefault("BITRIX_API_URL", "https://example.com/api")
 os.environ.setdefault("GEMINI_API_KEY", "test_key")
 
+
 def _mock_pkg(name):
     mod = types.ModuleType(name)
     sys.modules[name] = mod
     return mod
+
 
 if 'google' not in sys.modules:
     g   = _mock_pkg('google')
@@ -26,13 +29,10 @@ if 'google' not in sys.modules:
     gai.Client = MagicMock()
     g.genai    = gai
 
-if 'deep_translator' not in sys.modules:
-    dt = _mock_pkg('deep_translator')
-    dt.GoogleTranslator = MagicMock()
-
-from core import logic
-from core.logic import (
+from core import logic  # noqa: E402
+from core.logic import (  # noqa: E402
     clean_tg_url,
+    parse_tg_urls,
     inject_font_size,
     validate_publication,
     with_retry,
@@ -40,12 +40,32 @@ from core.logic import (
     load_draft,
     clear_draft,
     check_duplicate,
+    find_duplicates,
     log_publication,
+    similarity,
+    preview_too_similar,
+    fit_preview,
+    fetch_posts,
+    enhance_with_ai,
+    translate_to_belarusian,
 )
 
 
+class FakeApiError(Exception):
+    """Похож на google.genai.errors.APIError: у него есть .code."""
+    def __init__(self, code):
+        super().__init__(f"api error {code}")
+        self.code = code
+
+
+def _resp(text):
+    r = MagicMock()
+    r.text = text
+    return r
+
+
 # ─────────────────────────────────────────────
-#  clean_tg_url
+#  clean_tg_url / parse_tg_urls
 # ─────────────────────────────────────────────
 
 class TestCleanTgUrl(unittest.TestCase):
@@ -71,6 +91,33 @@ class TestCleanTgUrl(unittest.TestCase):
             clean_tg_url("https://t.me/DOLOMIT_RUBA/42?foo=bar"),
             "https://t.me/DOLOMIT_RUBA/42",
         )
+
+
+class TestParseTgUrls(unittest.TestCase):
+
+    def test_one_url(self):
+        self.assertEqual(parse_tg_urls("https://t.me/ch/1"), ["https://t.me/ch/1"])
+
+    def test_lines_spaces_and_commas(self):
+        raw = "https://t.me/ch/1\nhttps://t.me/ch/2, https://t.me/ch/3  https://t.me/ch/4"
+        self.assertEqual(
+            parse_tg_urls(raw),
+            [f"https://t.me/ch/{i}" for i in (1, 2, 3, 4)],
+        )
+
+    def test_dedup_keeps_order(self):
+        raw = "https://t.me/ch/2\nhttps://t.me/ch/1?single\nhttps://t.me/ch/2/"
+        self.assertEqual(parse_tg_urls(raw), ["https://t.me/ch/2", "https://t.me/ch/1"])
+
+    def test_without_scheme(self):
+        self.assertEqual(parse_tg_urls("t.me/ch/5"), ["https://t.me/ch/5"])
+
+    def test_ignores_channel_without_post_id(self):
+        self.assertEqual(parse_tg_urls("https://t.me/ch"), [])
+
+    def test_empty_and_garbage(self):
+        self.assertEqual(parse_tg_urls(""), [])
+        self.assertEqual(parse_tg_urls("просто текст"), [])
 
 
 # ─────────────────────────────────────────────
@@ -149,6 +196,16 @@ class TestValidatePublication(unittest.TestCase):
         issues = self._call(ru_title="", ru_text="", preview_image_url=None)
         self.assertGreaterEqual(len(issues), 3)
 
+    def test_valid_active_from(self):
+        self.assertEqual(self._call(active_from="15.03.2026 09:30:00"), [])
+
+    def test_invalid_active_from_caught(self):
+        issues = self._call(active_from="2026-03-15")
+        self.assertTrue(any("активности" in i.lower() for i in issues))
+
+    def test_empty_active_from_ignored(self):
+        self.assertEqual(self._call(active_from=""), [])
+
 
 # ─────────────────────────────────────────────
 #  with_retry
@@ -203,11 +260,11 @@ class TestDraft(unittest.TestCase):
             os.remove(self._path)
 
     def test_save_and_load(self):
-        data = {"tg_url": "https://t.me/ch/1", "data": {"ru": {"title": "Test"}}}
+        data = {"tg_urls": ["https://t.me/ch/1"], "data": {"ru": {"title": "Test"}}}
         save_draft(data)
         loaded = load_draft()
         self.assertIsNotNone(loaded)
-        self.assertEqual(loaded["tg_url"], "https://t.me/ch/1")
+        self.assertEqual(loaded["tg_urls"], ["https://t.me/ch/1"])
         self.assertEqual(loaded["data"]["ru"]["title"], "Test")
 
     def test_load_none_when_missing(self):
@@ -260,6 +317,479 @@ class TestPublicationLog(unittest.TestCase):
         self.assertTrue(check_duplicate("https://t.me/ch/1"))
         self.assertTrue(check_duplicate("https://t.me/ch/2"))
         self.assertFalse(check_duplicate("https://t.me/ch/3"))
+
+    def test_merged_news_logs_every_url(self):
+        log_publication(["https://t.me/ch/1", "https://t.me/ch/2"], "Merged", 7)
+        self.assertTrue(check_duplicate("https://t.me/ch/1"))
+        self.assertTrue(check_duplicate("https://t.me/ch/2"))
+        self.assertFalse(check_duplicate("https://t.me/ch/3"))
+        # одна новость — одна строка в истории
+        self.assertEqual(len(logic.read_publications()), 1)
+
+    def test_url_prefix_is_not_duplicate(self):
+        log_publication("https://t.me/ch/12", "A", 1)
+        self.assertFalse(check_duplicate("https://t.me/ch/1"))
+
+    def test_find_duplicates(self):
+        log_publication(["https://t.me/ch/1", "https://t.me/ch/2"], "M", 1)
+        self.assertEqual(
+            find_duplicates(["https://t.me/ch/2", "https://t.me/ch/5"]),
+            ["https://t.me/ch/2"],
+        )
+
+    def test_find_duplicates_without_file(self):
+        self.assertEqual(find_duplicates(["https://t.me/ch/1"]), [])
+
+
+# ─────────────────────────────────────────────
+#  Загрузка постов и объединение
+# ─────────────────────────────────────────────
+
+class TestFetchPostData(unittest.TestCase):
+
+    def test_inline_tags_do_not_break_sentences(self):
+        html = (
+            '<div class="tgme_widget_message_text">'
+            'Работники <b>ОАО «Доломит»</b> приняли участие в <a href="x">акции</a>.'
+            '<br/>Вторая строка</div>'
+        )
+        resp = MagicMock(text=html)
+        with patch.object(logic.requests, "get", return_value=resp):
+            text, _, _, _ = logic.fetch_post_data("https://t.me/ch/1")
+        self.assertEqual(
+            text,
+            "Работники ОАО «Доломит» приняли участие в акции.\nВторая строка",
+        )
+
+
+class TestFetchPosts(unittest.TestCase):
+
+    def _fake(self, mapping):
+        return lambda url: mapping[url]
+
+    def test_single_post_has_no_markers(self):
+        mapping = {"u1": ("Текст", ["a.jpg"], False, "01.02.2026 10:00:00")}
+        with patch.object(logic, "fetch_post_data", self._fake(mapping)):
+            m = fetch_posts(["u1"])
+        self.assertEqual(m.text, "Текст")
+        self.assertEqual(m.posts_count, 1)
+        self.assertEqual(m.image_urls, ["a.jpg"])
+
+    def test_merge_texts_images_and_earliest_time(self):
+        mapping = {
+            "u1": ("Первый", ["a.jpg", "b.jpg"], False, "01.02.2026 12:00:00"),
+            "u2": ("Второй", ["b.jpg", "c.jpg"], True,  "01.02.2026 09:30:00"),
+        }
+        with patch.object(logic, "fetch_post_data", self._fake(mapping)):
+            m = fetch_posts(["u1", "u2"])
+        self.assertIn("[ПОСТ 1 из 2]\nПервый", m.text)
+        self.assertIn("[ПОСТ 2 из 2]\nВторой", m.text)
+        self.assertLess(m.text.index("Первый"), m.text.index("Второй"))
+        self.assertEqual(m.image_urls, ["a.jpg", "b.jpg", "c.jpg"])
+        self.assertTrue(m.has_video)
+        self.assertEqual(m.post_dt, "01.02.2026 09:30:00")
+        self.assertEqual(m.posts_count, 2)
+
+    def test_photo_only_post_adds_images_not_text(self):
+        mapping = {
+            "u1": ("Текст", [], False, None),
+            "u2": ("",      ["p.jpg"], False, None),
+        }
+        with patch.object(logic, "fetch_post_data", self._fake(mapping)):
+            m = fetch_posts(["u1", "u2"])
+        self.assertEqual(m.text, "Текст")          # без меток: текст один
+        self.assertEqual(m.text_posts, 1)
+        self.assertEqual(m.posts_count, 2)
+        self.assertEqual(m.image_urls, ["p.jpg"])
+        self.assertIsNone(m.post_dt)
+
+    def test_no_text_anywhere_gives_empty_text(self):
+        mapping = {"u1": ("", ["p.jpg"], False, None)}
+        with patch.object(logic, "fetch_post_data", self._fake(mapping)):
+            self.assertEqual(fetch_posts(["u1"]).text, "")
+
+    def test_network_error_names_the_url(self):
+        import requests
+
+        def boom(url):
+            raise requests.ConnectionError("down")
+
+        with patch.object(logic, "fetch_post_data", boom):
+            with self.assertRaises(RuntimeError) as cm:
+                fetch_posts(["https://t.me/ch/9"])
+        self.assertIn("https://t.me/ch/9", str(cm.exception))
+
+    def test_empty_list_rejected(self):
+        with self.assertRaises(ValueError):
+            fetch_posts([])
+
+
+# ─────────────────────────────────────────────
+#  Анонс: похожесть на заголовок и обрезка
+# ─────────────────────────────────────────────
+
+class TestPreviewSimilarity(unittest.TestCase):
+
+    def test_exact_copy_is_too_similar(self):
+        t = "Работники ОАО «Доломит» почтили память павших героев."
+        self.assertTrue(preview_too_similar(t, t))
+
+    def test_copy_with_small_addition_is_too_similar(self):
+        self.assertTrue(preview_too_similar(
+            "Работники ОАО «Доломит» почтили память павших героев.",
+            "Работники ОАО «Доломит» почтили память павших героев в День Победы.",
+        ))
+
+    def test_reworded_headline_is_too_similar(self):
+        self.assertTrue(preview_too_similar(
+            "Масленица в микрорайоне Руба прошла весело и вкусно!",
+            "Масленица в микрорайоне Руба прошла очень весело.",
+        ))
+
+    def test_good_previews_pass(self):
+        pairs = [
+            ("Масленица в микрорайоне Руба прошла весело и вкусно!",
+             "В минувшие выходные работники ОАО «Доломит», жители и гости "
+             "микрорайона собрались, чтобы весело проводить зиму и встретить весну."),
+            ("Работники ОАО «Доломит» почтили память павших героев.",
+             "В День защитников Отечества представители предприятия приняли участие "
+             "в церемонии возложения цветов к памятнику Неизвестному солдату."),
+        ]
+        for title, preview in pairs:
+            self.assertFalse(preview_too_similar(title, preview), preview)
+
+    def test_empty_inputs_not_similar(self):
+        self.assertEqual(similarity("", "что-то"), 0.0)
+        self.assertEqual(similarity("что-то", ""), 0.0)
+
+
+class TestFitPreview(unittest.TestCase):
+
+    def test_short_unchanged(self):
+        self.assertEqual(fit_preview("Короткий анонс."), "Короткий анонс.")
+
+    def test_never_exceeds_limit(self):
+        for text in ("слово " * 100, "А" * 400, "Предложение номер один. " * 30):
+            self.assertLessEqual(len(fit_preview(text, 150)), 150)
+
+    def test_prefers_sentence_end(self):
+        text = "Первое предложение довольно длинное и содержательное. " \
+               "Второе предложение тоже длинное и тоже очень содержательное, но не влезет."
+        result = fit_preview(text, 100)
+        self.assertTrue(result.endswith("."))
+        self.assertNotIn("Второе", result)
+
+    def test_ellipsis_when_no_sentence_end(self):
+        result = fit_preview("слово " * 100, 50)
+        self.assertTrue(result.endswith("…"))
+        self.assertLessEqual(len(result), 50)
+
+
+# ─────────────────────────────────────────────
+#  Вызов Gemini: лог, лимиты, переключение моделей
+# ─────────────────────────────────────────────
+
+class _GenerateBase(unittest.TestCase):
+    """Подменяет client и файл лога запросов."""
+
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        os.remove(path)
+        self._req_path = path
+        self._orig_req = logic.REQUESTS_LOG
+        logic.REQUESTS_LOG = path
+        self.client = MagicMock()
+        self._patch_client = patch.object(logic, "client", self.client)
+        self._patch_client.start()
+        self._patch_sleep = patch.object(logic.time, "sleep", lambda s: None)
+        self._patch_sleep.start()
+        self.names = list(logic.MODELS.keys())
+        self.apis  = list(logic.MODELS.values())
+
+    def tearDown(self):
+        self._patch_client.stop()
+        self._patch_sleep.stop()
+        logic.REQUESTS_LOG = self._orig_req
+        if os.path.exists(self._req_path):
+            os.remove(self._req_path)
+
+
+class TestGenerate(_GenerateBase):
+
+    def test_success_logs_request_under_model_name(self):
+        self.client.models.generate_content.return_value = _resp("  ответ  ")
+        out = logic._generate("p", self.apis[0], self.names[0], "full")
+        self.assertEqual(out, "ответ")
+        self.assertEqual(logic.get_today_usage(), {self.names[0]: 1})
+
+    def test_json_mode_passes_config(self):
+        self.client.models.generate_content.return_value = _resp("{}")
+        logic._generate("p", self.apis[0], self.names[0], "full", json_mode=True)
+        kwargs = self.client.models.generate_content.call_args.kwargs
+        self.assertEqual(kwargs["config"]["response_mime_type"], "application/json")
+
+    def test_429_switches_to_next_model(self):
+        self.client.models.generate_content.side_effect = [
+            FakeApiError(429), _resp("из резерва"),
+        ]
+        out = logic._generate("p", self.apis[0], self.names[0], "full")
+        self.assertEqual(out, "из резерва")
+        used = [c.kwargs["model"] for c in self.client.models.generate_content.call_args_list]
+        self.assertEqual(used, [self.apis[0], self.apis[1]])
+        # в лог попала модель, которая реально ответила
+        self.assertEqual(logic.get_today_usage(), {self.names[1]: 1})
+
+    def test_503_retries_same_model_once(self):
+        self.client.models.generate_content.side_effect = [FakeApiError(503), _resp("ok")]
+        self.assertEqual(logic._generate("p", self.apis[0], self.names[0], "full"), "ok")
+        used = [c.kwargs["model"] for c in self.client.models.generate_content.call_args_list]
+        self.assertEqual(used, [self.apis[0], self.apis[0]])
+
+    def test_all_models_429_raises_runtime_error(self):
+        self.client.models.generate_content.side_effect = FakeApiError(429)
+        with self.assertRaises(RuntimeError):
+            logic._generate("p", self.apis[0], self.names[0], "full")
+        self.assertEqual(self.client.models.generate_content.call_count, len(self.apis))
+
+    def test_other_errors_propagate(self):
+        self.client.models.generate_content.side_effect = FakeApiError(400)
+        with self.assertRaises(FakeApiError):
+            logic._generate("p", self.apis[0], self.names[0], "full")
+        self.assertEqual(self.client.models.generate_content.call_count, 1)
+
+    def test_empty_answer_raises(self):
+        self.client.models.generate_content.return_value = _resp("")
+        with self.assertRaises(ValueError):
+            logic._generate("p", self.apis[0], self.names[0], "full")
+
+    def test_model_over_local_limit_is_skipped(self):
+        for _ in range(logic.get_limit(self.names[0])):
+            logic.log_request(self.names[0], "full")
+        self.client.models.generate_content.return_value = _resp("ok")
+        logic._generate("p", self.apis[0], self.names[0], "full")
+        used = [c.kwargs["model"] for c in self.client.models.generate_content.call_args_list]
+        self.assertEqual(used, [self.apis[1]])
+
+    def test_all_models_over_limit_raises(self):
+        for name in self.names:
+            for _ in range(logic.get_limit(name)):
+                logic.log_request(name, "full")
+        with self.assertRaises(RuntimeError):
+            logic._generate("p", self.apis[0], self.names[0], "full")
+        self.client.models.generate_content.assert_not_called()
+
+
+# ─────────────────────────────────────────────
+#  Генерация заголовка / анонса / текста
+# ─────────────────────────────────────────────
+
+GOOD_AI = {
+    "title":   "Работники ОАО «Доломит» почтили память павших героев.",
+    "preview": "В День защитников Отечества представители предприятия возложили цветы.",
+    "text":    "<p>Первый абзац.</p><p>Второй абзац.</p>",
+}
+
+
+class TestEnhanceWithAi(_GenerateBase):
+
+    def _prompt(self):
+        return self.client.models.generate_content.call_args_list[0].kwargs["contents"]
+
+    def test_returns_parts(self):
+        self.client.models.generate_content.return_value = _resp(json.dumps(GOOD_AI))
+        t, p, x = enhance_with_ai("сырой текст", self.apis[0], self.names[0])
+        self.assertEqual((t, p, x), (GOOD_AI["title"], GOOD_AI["preview"], GOOD_AI["text"]))
+        self.assertEqual(self.client.models.generate_content.call_count, 1)
+
+    def test_single_post_prompt_has_no_merge_instruction(self):
+        self.client.models.generate_content.return_value = _resp(json.dumps(GOOD_AI))
+        enhance_with_ai("сырой текст", self.apis[0], self.names[0])
+        self.assertNotIn("Объедини", self._prompt())
+
+    def test_merge_prompt_for_several_posts(self):
+        self.client.models.generate_content.return_value = _resp(json.dumps(GOOD_AI))
+        enhance_with_ai("[ПОСТ 1 из 2]\nа\n\n[ПОСТ 2 из 2]\nб", self.apis[0],
+                        self.names[0], posts_count=2)
+        prompt = self._prompt()
+        self.assertIn("Объедини", prompt)
+        self.assertIn("2 постов", prompt)
+
+    def test_prompt_has_json_example_with_single_braces(self):
+        self.client.models.generate_content.return_value = _resp(json.dumps(GOOD_AI))
+        enhance_with_ai("x", self.apis[0], self.names[0])
+        self.assertIn('{"title":', self._prompt())
+        self.assertNotIn('{{', self._prompt())
+
+    def test_similar_preview_is_regenerated_with_feedback(self):
+        bad = dict(GOOD_AI, preview=GOOD_AI["title"])
+        self.client.models.generate_content.side_effect = [
+            _resp(json.dumps(bad)),
+            _resp("Стороны возложили цветы к памятнику Неизвестному солдату."),
+        ]
+        t, p, x = enhance_with_ai("x", self.apis[0], self.names[0])
+        self.assertEqual(p, "Стороны возложили цветы к памятнику Неизвестному солдату.")
+        self.assertEqual(self.client.models.generate_content.call_count, 2)
+        second_prompt = self.client.models.generate_content.call_args_list[1].kwargs["contents"]
+        self.assertIn(GOOD_AI["title"], second_prompt)   # заголовок передан модели
+
+    def test_failed_regeneration_keeps_generated_preview(self):
+        bad = dict(GOOD_AI, preview=GOOD_AI["title"])
+        self.client.models.generate_content.side_effect = [
+            _resp(json.dumps(bad)), FakeApiError(400),
+        ]
+        _, p, _ = enhance_with_ai("x", self.apis[0], self.names[0])
+        self.assertEqual(p, bad["preview"])
+
+    def test_long_preview_is_fitted(self):
+        long = dict(GOOD_AI, preview="Совсем другие слова " * 30)
+        self.client.models.generate_content.return_value = _resp(json.dumps(long))
+        _, p, _ = enhance_with_ai("x", self.apis[0], self.names[0])
+        self.assertLessEqual(len(p), logic.PREVIEW_MAX_LEN)
+
+    def test_empty_title_raises(self):
+        self.client.models.generate_content.return_value = _resp(
+            json.dumps(dict(GOOD_AI, title="")))
+        with self.assertRaises(ValueError):
+            enhance_with_ai("x", self.apis[0], self.names[0])
+
+    def test_invalid_json_raises(self):
+        self.client.models.generate_content.return_value = _resp("не json")
+        with self.assertRaises(ValueError):
+            enhance_with_ai("x", self.apis[0], self.names[0])
+
+    def test_json_wrapped_in_text_is_parsed(self):
+        self.client.models.generate_content.return_value = _resp(
+            "Вот результат:\n" + json.dumps(GOOD_AI))
+        t, _, _ = enhance_with_ai("x", self.apis[0], self.names[0])
+        self.assertEqual(t, GOOD_AI["title"])
+
+
+class TestRegenerate(_GenerateBase):
+
+    def test_title_prompt_contains_previous_title(self):
+        self.client.models.generate_content.return_value = _resp('"Новый заголовок."')
+        out = logic.regenerate_title("текст", self.apis[0], self.names[0],
+                                     previous="Старый заголовок.")
+        self.assertEqual(out, "Новый заголовок.")
+        prompt = self.client.models.generate_content.call_args.kwargs["contents"]
+        self.assertIn("Старый заголовок.", prompt)
+
+    def test_preview_prompt_contains_title_and_previous(self):
+        self.client.models.generate_content.return_value = _resp("Анонс.")
+        logic.regenerate_preview("текст", self.apis[0], self.names[0],
+                                 title="Заголовок X.", previous="Старый анонс Y.")
+        prompt = self.client.models.generate_content.call_args.kwargs["contents"]
+        self.assertIn("Заголовок X.", prompt)
+        self.assertIn("Старый анонс Y.", prompt)
+
+    def test_preview_is_fitted(self):
+        self.client.models.generate_content.return_value = _resp("слово " * 100)
+        out = logic.regenerate_preview("текст", self.apis[0], self.names[0])
+        self.assertLessEqual(len(out), logic.PREVIEW_MAX_LEN)
+
+
+# ─────────────────────────────────────────────
+#  Перевод на белорусский через ИИ
+# ─────────────────────────────────────────────
+
+SRC_HTML = ('<p>\n\t<span style="font-size: 15pt;">Работники приняли участие в акции.'
+            '</span>\n</p>')
+BY_HTML  = ('<p>\n\t<span style="font-size: 15pt;">Работнікі прынялі ўдзел у акцыі.'
+            '</span>\n</p>')
+BY_OK = {"title": "Работнікі ААТ «Даламіт» ўшанавалі памяць.",
+         "preview": "Падрабязнасці ўнутры.", "text": BY_HTML}
+
+
+class TestTranslate(_GenerateBase):
+
+    def _translate(self):
+        return translate_to_belarusian(
+            "Работники ОАО «Доломит» почтили память.", "Подробности внутри.",
+            SRC_HTML, self.apis[0], self.names[0])
+
+    def test_one_request_for_whole_news(self):
+        self.client.models.generate_content.return_value = _resp(json.dumps(BY_OK))
+        t, p, x = self._translate()
+        self.assertEqual((t, p, x), (BY_OK["title"], BY_OK["preview"], BY_OK["text"]))
+        self.assertEqual(self.client.models.generate_content.call_count, 1)
+        self.assertEqual(logic.get_today_usage(), {self.names[0]: 1})
+
+    def test_prompt_has_glossary_and_source(self):
+        self.client.models.generate_content.return_value = _resp(json.dumps(BY_OK))
+        self._translate()
+        prompt = self.client.models.generate_content.call_args.kwargs["contents"]
+        for ru, by in logic.TRANSLATION_GLOSSARY.items():
+            self.assertIn(ru, prompt)
+            self.assertIn(by, prompt)
+        self.assertIn("Подробности внутри.", prompt)
+
+    def test_broken_tags_trigger_one_retry(self):
+        broken = dict(BY_OK, text="<p>Работнікі прынялі ўдзел у акцыі.</p>")
+        self.client.models.generate_content.side_effect = [
+            _resp(json.dumps(broken)), _resp(json.dumps(BY_OK)),
+        ]
+        _, _, x = self._translate()
+        self.assertEqual(x, BY_HTML)
+        self.assertEqual(self.client.models.generate_content.call_count, 2)
+        retry_prompt = self.client.models.generate_content.call_args_list[1].kwargs["contents"]
+        self.assertIn("HTML-теги", retry_prompt)
+
+    def test_still_broken_after_retry_raises(self):
+        broken = dict(BY_OK, text="<p>Работнікі прынялі ўдзел.</p>")
+        self.client.models.generate_content.return_value = _resp(json.dumps(broken))
+        with self.assertRaises(ValueError):
+            self._translate()
+        self.assertEqual(self.client.models.generate_content.call_count, 2)
+
+    def test_empty_title_triggers_retry(self):
+        self.client.models.generate_content.side_effect = [
+            _resp(json.dumps(dict(BY_OK, title=""))), _resp(json.dumps(BY_OK)),
+        ]
+        t, _, _ = self._translate()
+        self.assertEqual(t, BY_OK["title"])
+
+    def test_empty_preview_stays_empty(self):
+        self.client.models.generate_content.return_value = _resp(
+            json.dumps(dict(BY_OK, preview="")))
+        _, p, _ = translate_to_belarusian(
+            "Заголовок.", "", SRC_HTML, self.apis[0], self.names[0])
+        self.assertEqual(p, "")
+
+    def test_defaults_to_first_model(self):
+        self.client.models.generate_content.return_value = _resp(json.dumps(BY_OK))
+        translate_to_belarusian("З.", "А.", SRC_HTML)
+        self.assertEqual(self.client.models.generate_content.call_args.kwargs["model"],
+                         self.apis[0])
+
+
+class TestBelarusianChecks(unittest.TestCase):
+
+    RU_LONG = ("Работники предприятия приняли участие в праздничных мероприятиях и "
+               "подвели итоги работы за год, отметив лучших сотрудников. " * 3)
+    BY_LONG = ("Работнікі прадпрыемства прынялі ўдзел у святочных мерапрыемствах і "
+               "падвялі вынікі працы за год, адзначыўшы лепшых супрацоўнікаў. " * 3)
+
+    def test_russian_detected(self):
+        self.assertFalse(logic._looks_belarusian(self.RU_LONG))
+
+    def test_belarusian_passes(self):
+        self.assertTrue(logic._looks_belarusian(self.BY_LONG))
+
+    def test_short_text_not_checked(self):
+        self.assertTrue(logic._looks_belarusian("Работники приняли участие."))
+
+    def test_tags_are_ignored(self):
+        self.assertTrue(logic._looks_belarusian(
+            '<p><span style="font-size: 15pt;">' + self.BY_LONG + '</span></p>'))
+
+    def test_tag_comparison_ignores_text_and_whitespace(self):
+        a = '<p>\n<span style="font-size:  15pt;">Один</span>\n</p>'
+        b = '<p><span style="font-size: 15pt;">Адзін</span></p>'
+        self.assertIsNone(logic._translation_problem(a, b))
+
+    def test_tag_mismatch_reported(self):
+        self.assertIsNotNone(logic._translation_problem("<p>a</p>", "<p><b>a</b></p>"))
 
 
 if __name__ == "__main__":

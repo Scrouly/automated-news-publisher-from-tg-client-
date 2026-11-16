@@ -1,9 +1,10 @@
 """
-Бизнес-логика: получение поста, обработка ИИ, логирование, отправка на сайт.
+Бизнес-логика: получение постов, обработка ИИ, перевод, логирование, отправка на сайт.
 Не содержит ничего связанного с GUI.
 """
 
 import csv
+import difflib
 import io
 import json
 import logging
@@ -12,6 +13,7 @@ import re
 import time
 import requests
 from bs4 import BeautifulSoup
+from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import urlparse
 from PIL import Image
@@ -19,12 +21,14 @@ from google import genai
 
 from core.config import (
     SECRET_TOKEN, BITRIX_API_URL, GEMINI_API_KEY,
-    LOG_FILE, REQUESTS_LOG, DAILY_LIMIT, PREVIEW_MAX_LEN, DRAFT_FILE,
-    LIBRETRANSLATE_URL, LIBRETRANSLATE_API_KEY,
+    LOG_FILE, REQUESTS_LOG, DAILY_LIMIT, DAILY_LIMITS, PREVIEW_MAX_LEN, DRAFT_FILE,
+    MODELS, TRANSLATION_GLOSSARY,
 )
 
 log = logging.getLogger(__name__)
 client = genai.Client(api_key=GEMINI_API_KEY)
+
+TIME_FMT = "%d.%m.%Y %H:%M:%S"
 
 
 # ─────────────────────────────────────────────
@@ -34,6 +38,22 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 def clean_tg_url(url: str) -> str:
     parsed = urlparse(url)
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+
+def parse_tg_urls(raw: str) -> list[str]:
+    """
+    Достаёт ссылки на посты t.me из произвольного текста (по одной на строку,
+    через пробел или запятую), чистит параметры и убирает повторы, сохраняя порядок.
+    Ссылки без номера поста (например, просто t.me/channel) игнорируются.
+    """
+    urls: list[str] = []
+    for m in re.findall(r'(?:https?://)?(?:www\.)?(?:t|telegram)\.me/[^\s,;]+', raw or ""):
+        if not m.startswith("http"):
+            m = "https://" + m
+        url = clean_tg_url(m).rstrip("/")
+        if re.search(r'/\d+$', url) and url not in urls:
+            urls.append(url)
+    return urls
 
 
 # ─────────────────────────────────────────────
@@ -63,25 +83,44 @@ def with_retry(fn, *args, retries: int = 2, delay: float = 1.5,
 
 # ─────────────────────────────────────────────
 #  ЛОГ ПУБЛИКАЦИЙ
+#  В колонке tg_url может быть несколько ссылок через пробел
+#  (новость, собранная из нескольких постов).
 # ─────────────────────────────────────────────
+
+def _row_urls(row: dict) -> list[str]:
+    return (row.get('tg_url') or '').split()
+
 
 def check_duplicate(tg_url: str) -> bool:
     if not os.path.isfile(LOG_FILE):
         return False
     with open(LOG_FILE, 'r', encoding='utf-8') as f:
         for row in csv.DictReader(f):
-            if row.get('tg_url') == tg_url:
+            if tg_url in _row_urls(row):
                 return True
     return False
 
 
-def log_publication(tg_url: str, title: str, bitrix_id):
+def find_duplicates(urls: list[str]) -> list[str]:
+    """Возвращает те из ссылок, которые уже публиковались."""
+    if not os.path.isfile(LOG_FILE):
+        return []
+    seen: set[str] = set()
+    with open(LOG_FILE, 'r', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            seen.update(_row_urls(row))
+    return [u for u in urls if u in seen]
+
+
+def log_publication(tg_url: "str | list[str]", title: str, bitrix_id):
+    if isinstance(tg_url, (list, tuple)):
+        tg_url = " ".join(tg_url)
     file_exists = os.path.isfile(LOG_FILE)
     with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(['date', 'tg_url', 'title', 'bitrix_id'])
-        writer.writerow([datetime.now().strftime("%d.%m.%Y %H:%M:%S"), tg_url, title, bitrix_id])
+        writer.writerow([datetime.now().strftime(TIME_FMT), tg_url, title, bitrix_id])
 
 
 def read_publications() -> list[dict]:
@@ -103,7 +142,7 @@ def log_request(model_name: str, request_type: str):
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(['date', 'model', 'type'])
-        writer.writerow([datetime.now().strftime("%d.%m.%Y %H:%M:%S"), model_name, request_type])
+        writer.writerow([datetime.now().strftime(TIME_FMT), model_name, request_type])
 
 
 def get_today_usage() -> dict[str, int]:
@@ -119,10 +158,14 @@ def get_today_usage() -> dict[str, int]:
     return usage
 
 
+def get_limit(model_name: str) -> int:
+    return DAILY_LIMITS.get(model_name, DAILY_LIMIT)
+
+
 def check_limit(model_name: str) -> tuple[bool, int, int]:
-    usage = get_today_usage()
-    used  = usage.get(model_name, 0)
-    return used < DAILY_LIMIT, used, DAILY_LIMIT
+    used  = get_today_usage().get(model_name, 0)
+    limit = get_limit(model_name)
+    return used < limit, used, limit
 
 
 # ─────────────────────────────────────────────
@@ -157,10 +200,12 @@ def clear_draft():
 # ─────────────────────────────────────────────
 
 def validate_publication(ru_title: str, ru_preview: str, ru_text: str,
-                          preview_image_url: str | None) -> list[str]:
+                          preview_image_url: str | None,
+                          active_from: str | None = None) -> list[str]:
     """
     Проверяет данные перед отправкой.
     Возвращает список строк с описанием проблем (пустой список = всё ОК).
+    active_from — если передан и не пуст, должен быть в формате ДД.ММ.ГГГГ ЧЧ:ММ:СС.
     """
     issues: list[str] = []
 
@@ -179,6 +224,12 @@ def validate_publication(ru_title: str, ru_preview: str, ru_text: str,
 
     if not preview_image_url:
         issues.append("Фото для анонса не выбрано")
+
+    if active_from:
+        try:
+            datetime.strptime(active_from, TIME_FMT)
+        except ValueError:
+            issues.append("Начало активности: нужен формат ДД.ММ.ГГГГ ЧЧ:ММ:СС")
 
     return issues
 
@@ -200,7 +251,13 @@ def fetch_post_data(tg_url: str) -> tuple[str, list[str], bool, str | None]:
 
     soup      = BeautifulSoup(resp.text, 'html.parser')
     text_el   = soup.find('div', class_=re.compile(r'tgme_widget_message_text'))
-    post_text = text_el.get_text(separator='\n') if text_el else ""
+    post_text = ""
+    if text_el:
+        # Переносы строк — только из <br>. Раньше get_text(separator='\n') ставил
+        # перенос между любыми узлами и рвал предложения на каждом <b>/<a>/<i>.
+        for br in text_el.find_all('br'):
+            br.replace_with('\n')
+        post_text = text_el.get_text().strip()
     has_video = bool(
         soup.find('video') or
         soup.find('a', class_=re.compile(r'tgme_widget_message_video'))
@@ -221,133 +278,349 @@ def fetch_post_data(tg_url: str) -> tuple[str, list[str], bool, str | None]:
         try:
             dt = datetime.fromisoformat(time_el['datetime'])
             dt_local = dt.astimezone().replace(tzinfo=None)
-            post_dt = dt_local.strftime("%d.%m.%Y %H:%M:%S")
+            post_dt = dt_local.strftime(TIME_FMT)
         except (ValueError, TypeError):
             pass
 
     return post_text, image_urls, has_video, post_dt
 
 
+@dataclass
+class MergedPost:
+    """Результат загрузки одного или нескольких постов как одного материала."""
+    urls:        list[str]
+    text:        str                 # текст постов; при нескольких — с метками [ПОСТ i из n]
+    image_urls:  list[str] = field(default_factory=list)
+    has_video:   bool = False
+    post_dt:     str | None = None   # время самого раннего поста
+    posts_count: int = 1             # сколько постов загружено
+    text_posts:  int = 1             # в скольких из них был текст
+
+
+def fetch_posts(urls: list[str]) -> MergedPost:
+    """
+    Загружает несколько постов и склеивает их в один материал для ИИ.
+    - тексты идут в порядке ссылок, каждый помечен [ПОСТ i из n];
+    - фото собираются из всех постов без повторов (порядок сохраняется);
+    - посты без текста (одни фото) допустимы — из них берутся только фотографии;
+    - время активности — время самого раннего поста.
+    """
+    if not urls:
+        raise ValueError("Не указано ни одной ссылки на пост")
+
+    texts: list[str] = []
+    images: list[str] = []
+    has_video = False
+    dts: list[datetime] = []
+
+    for url in urls:
+        try:
+            text, imgs, video, dt = fetch_post_data(url)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Не удалось загрузить {url}: {exc}") from exc
+        if text.strip():
+            texts.append(text.strip())
+        for u in imgs:
+            if u not in images:
+                images.append(u)
+        has_video = has_video or video
+        if dt:
+            try:
+                dts.append(datetime.strptime(dt, TIME_FMT))
+            except ValueError:
+                pass
+
+    if len(texts) <= 1:
+        merged_text = texts[0] if texts else ""
+    else:
+        n = len(texts)
+        merged_text = "\n\n".join(f"[ПОСТ {i} из {n}]\n{t}" for i, t in enumerate(texts, 1))
+
+    return MergedPost(
+        urls=list(urls),
+        text=merged_text,
+        image_urls=images,
+        has_video=has_video,
+        post_dt=min(dts).strftime(TIME_FMT) if dts else None,
+        posts_count=len(urls),
+        text_posts=len(texts),
+    )
+
+
+# ─────────────────────────────────────────────
+#  ИИ — ОБЩИЙ ВЫЗОВ С ПЕРЕКЛЮЧЕНИЕМ МОДЕЛЕЙ
+# ─────────────────────────────────────────────
+
+_RETRYABLE_CODES = (429, 500, 502, 503, 504)
+
+
+def _parse_json(raw: str) -> dict:
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if not match:
+            raise ValueError(f"ИИ не вернул валидный JSON. Ответ: {raw[:300]}")
+        try:
+            data = json.loads(match.group())
+        except ValueError:
+            raise ValueError(f"ИИ вернул повреждённый JSON. Ответ: {raw[:300]}")
+    if not isinstance(data, dict):
+        raise ValueError(f"ИИ вернул не JSON-объект. Ответ: {raw[:300]}")
+    return data
+
+
+def _generate(prompt: str, model_api: str, model_name: str,
+              request_type: str, json_mode: bool = False) -> str:
+    """
+    Вызывает Gemini. Если выбранная модель ответила 429 (лимит) или 5xx — после
+    одного повтора при 5xx переходит на следующую модель из MODELS. Модели, у которых
+    исчерпан локальный дневной лимит, пропускаются. Запрос пишется в лог под именем
+    той модели, которая реально ответила.
+    """
+    candidates = [(model_name, model_api)] + [
+        (n, a) for n, a in MODELS.items() if a != model_api
+    ]
+    kwargs = {"config": {"response_mime_type": "application/json"}} if json_mode else {}
+
+    last_exc: Exception | None = None
+    for name, api in candidates:
+        if not check_limit(name)[0]:
+            log.info("Пропускаю %s: локальный дневной лимит исчерпан", name)
+            continue
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=api, contents=prompt, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                code = getattr(exc, "code", None)
+                if code not in _RETRYABLE_CODES:
+                    raise
+                if code != 429 and attempt == 0:
+                    time.sleep(2)
+                    continue
+                log.warning("%s: ошибка %s — перехожу на следующую модель", name, code)
+                break
+            log_request(name, request_type)
+            text = getattr(response, "text", None)
+            if not text or not text.strip():
+                raise ValueError(
+                    "ИИ вернул пустой ответ (возможно, сработал фильтр безопасности)")
+            return text.strip()
+
+    if last_exc is not None:
+        raise RuntimeError(
+            "Не удалось получить ответ ни от одной модели (лимиты исчерпаны?): "
+            f"{last_exc}") from last_exc
+    raise RuntimeError("Дневной лимит исчерпан для всех моделей. Попробуйте завтра.")
+
+
+# ─────────────────────────────────────────────
+#  АНОНС: КОНТРОЛЬ ПОХОЖЕСТИ НА ЗАГОЛОВОК
+# ─────────────────────────────────────────────
+
+PREVIEW_SIMILARITY_LIMIT = 0.6
+_STOP_STEMS = {"долом"}   # «Доломит» есть почти в каждом заголовке и анонсе — не считаем повтором
+
+
+def _norm(text: str) -> str:
+    return re.sub(r'[^a-zа-я0-9]+', ' ', text.lower().replace('ё', 'е')).strip()
+
+
+def _stems(text: str) -> set[str]:
+    """Грубые «основы» слов (первые 5 букв): ловят одно слово в разных падежах."""
+    return {w[:5] for w in _norm(text).split() if len(w) > 3} - _STOP_STEMS
+
+
+def similarity(title: str, preview: str) -> float:
+    """0..1: насколько анонс повторяет заголовок (общие слова + общая строка)."""
+    a, b = _stems(title), _stems(preview)
+    if not a or not b:
+        return 0.0
+    overlap = len(a & b) / len(a)   # доля слов заголовка, которые уже есть в анонсе
+    ratio = difflib.SequenceMatcher(None, _norm(title), _norm(preview)).ratio()
+    return max(overlap, ratio)
+
+
+def preview_too_similar(title: str, preview: str) -> bool:
+    return similarity(title, preview) >= PREVIEW_SIMILARITY_LIMIT
+
+
+def fit_preview(preview: str, limit: int = PREVIEW_MAX_LEN) -> str:
+    """Обрезает анонс до limit символов (вместе с многоточием), лучше по концу предложения."""
+    preview = preview.strip()
+    if len(preview) <= limit:
+        return preview
+    cut = preview[:limit]
+    end = max(cut.rfind('. '), cut.rfind('! '), cut.rfind('? '))
+    if end >= limit * 0.5:
+        return cut[:end + 1]
+    cut = preview[:limit - 1].rsplit(' ', 1)[0].rstrip('.,;:—- ')
+    return cut + '…'
+
+
+_PREVIEW_RULES = """\
+АНОНС (preview) — самостоятельный текст для ленты новостей: строго 1–2 предложения, не более {max_len} символов.
+ГЛАВНОЕ ПРАВИЛО: анонс НЕ пересказывает заголовок. Читатель видит заголовок прямо над анонсом, поэтому анонс обязан добавить то, чего в заголовке нет: когда и где это было, кто участвовал, что именно произошло, какой результат или цифра.
+- Не начинай анонс теми же словами, что и заголовок, и не повторяй формулировку заголовка другими словами.
+- Не используй сказуемое и ключевые слова заголовка, если без них можно обойтись.
+- Бери только факты из текста, ничего не выдумывай. Кавычки — только «ёлочки».
+
+Примеры пары «заголовок → анонс»:
+Заголовок: Масленица в микрорайоне Руба прошла весело и вкусно!
+ПЛОХО (повтор): Масленица в микрорайоне Руба прошла весело и вкусно.
+ХОРОШО: В минувшие выходные работники ОАО «Доломит», жители и гости микрорайона собрались, чтобы весело проводить зиму и встретить весну.
+
+Заголовок: Работники ОАО «Доломит» почтили память павших героев.
+ПЛОХО (повтор): Работники ОАО «Доломит» почтили память павших героев.
+ХОРОШО: В День защитников Отечества представители предприятия приняли участие в церемонии возложения цветов к памятнику Неизвестному солдату."""
+
+
 # ─────────────────────────────────────────────
 #  ИИ — ПОЛНАЯ ГЕНЕРАЦИЯ
 # ─────────────────────────────────────────────
 
-def enhance_with_ai(raw_text: str, model_api: str, model_name: str) -> tuple[str, str, str]:
-    """Полная генерация: заголовок + анонс + текст."""
-    prompt = f"""
-Ты — ведущий редактор пресс-службы предприятия ОАО «Доломит». 
-Твоя задача: переработать текст из Telegram в профессиональную новостную заметку для официального сайта.
+_ENHANCE_PROMPT = """\
+Ты — ведущий редактор пресс-службы предприятия ОАО «Доломит».
+Твоя задача: переработать {source_desc} в профессиональную новостную заметку для официального сайта.
 
 ### ГЛАВНЫЕ ПРАВИЛА:
-1. КАВЫЧКИ: Используй исключительно «елочки». КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО их удалять или заменять на "".
-2. ЗАГОЛОВОК (title): Должен быть коротким, емким и заканчиваться точкой или восклицательным знаком. Это отдельное поле, оно НЕ должно дублироваться внутри текста новости.
-3. АНОНС (preview): Строго 1-2 предложения (до {PREVIEW_MAX_LEN} символов). Это краткая выжимка для ленты новостей.
-4. ПОЛНЫЙ ТЕКСТ (text): 
-   - Должен содержать ВЕСЬ исходный текст сообщения без сокращений.
-   - НЕ ВКЛЮЧАЙ заголовок в начало текста. Текст должен начинаться сразу с первого предложения новости.
-   - Если ты использовал первое предложение для анонса (preview), оно ВСЕ РАВНО должно остаться в полном тексте (text).
-   - Разбей текст на логические абзацы, обернув каждый в тег <p>. 
+1. КАВЫЧКИ: используй исключительно «ёлочки». КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО удалять их или заменять на "".
+2. ЗАГОЛОВОК (title): короткий, ёмкий, заканчивается точкой или восклицательным знаком. Это отдельное поле, в тексте новости он НЕ дублируется.
+3. {preview_rules}
+4. ПОЛНЫЙ ТЕКСТ (text):
+   - {text_rule}
+   - НЕ включай заголовок в начало текста: текст начинается сразу с первого предложения новости.
+   - Если ты использовал предложение для анонса, оно ВСЁ РАВНО остаётся в полном тексте.
+   - Разбей текст на логические абзацы, обернув каждый в тег <p>.
    - Удали эмодзи, хештеги (#новости) и призывы «подпишись на наш канал».
 
-Исходный текст:
-{raw_text}
-
-### ПРИМЕРЫ ЗАГОЛОВКОВ (для поля "title"):
+### ПРИМЕРЫ ЗАГОЛОВКОВ:
 - Работники ОАО «Доломит» почтили память павших героев.
 - Масленица в микрорайоне Руба прошла весело и вкусно!
 - В ОАО «Доломит» прошёл Единый день информирования.
 - 29.01.2026 с рабочим визитом в ОАО «Доломит» прибыли представители компании CUEC.
 
-### ПРИМЕРЫ АНОНСОВ (для поля "preview"):
-- В День защитников Отечества, работники ОАО «Доломит» приняли участие в церемонии возложения цветов к памятнику Неизвестному солдату.
-- В минувшие выходные работники ОАО «Доломит», жители и гости микрорайона собрались, чтобы весело проводить зиму и встретить весну.
-- Тема: «Оборонительная мощь белорусской армии и патриотизм в современных условиях».
-- С 12 по 15 февраля выставка объединила более 180 ведущих учреждений образования и организаций.
+### ИСХОДНЫЙ МАТЕРИАЛ:
+{raw_text}
 
-### ФОРМАТ ОТВЕТА (JSON):
-{{{{
-    "title": "Только заголовок",
-    "preview": "Только краткий анонс до {PREVIEW_MAX_LEN} симв.",
-    "text": "Полный текст поста без заголовка в начале, с тегами <p>"
-}}}}
+### ФОРМАТ ОТВЕТА
+Верни ТОЛЬКО JSON-объект с тремя строковыми полями:
+{{"title": "заголовок", "preview": "анонс", "text": "полный текст с тегами <p>"}}
 """
-    response = client.models.generate_content(model=model_api, contents=prompt)
-    log_request(model_name, 'full')
 
-    match = re.search(r'\{.*\}', response.text.strip(), re.DOTALL)
-    if not match:
-        raise ValueError(f"ИИ не вернул валидный JSON. Ответ: {response.text[:300]}")
 
-    ai_data = json.loads(match.group())
-    title   = ai_data.get('title',   '').strip()
-    preview = ai_data.get('preview', '').strip()
-    text    = ai_data.get('text',    '').strip()
+def enhance_with_ai(raw_text: str, model_api: str, model_name: str,
+                    posts_count: int = 1) -> tuple[str, str, str]:
+    """
+    Полная генерация: заголовок + анонс + текст.
+    posts_count > 1 — исходник состоит из нескольких постов [ПОСТ i из n],
+    которые нужно объединить в одну новость.
+    """
+    if posts_count > 1:
+        source_desc = (f"{posts_count} постов из Telegram об одном событии или теме "
+                       "(они помечены [ПОСТ i из n])")
+        text_rule = (
+            f"Объедини все {posts_count} поста в ОДНУ связную новость: расположи факты в "
+            "логичном порядке, убери повторы между постами, но сохрани ВСЕ уникальные факты, "
+            "цифры, фамилии, даты и цитаты. Метки [ПОСТ …] в ответ не включай."
+        )
+    else:
+        source_desc = "текст из Telegram"
+        text_rule = "Должен содержать ВЕСЬ исходный текст сообщения без сокращений."
+
+    prompt = _ENHANCE_PROMPT.format(
+        source_desc=source_desc,
+        preview_rules=_PREVIEW_RULES.format(max_len=PREVIEW_MAX_LEN),
+        text_rule=text_rule,
+        raw_text=raw_text,
+    )
+    raw  = _generate(prompt, model_api, model_name, 'full', json_mode=True)
+    data = _parse_json(raw)
+
+    title   = str(data.get('title',   '') or '').strip()
+    preview = str(data.get('preview', '') or '').strip()
+    text    = str(data.get('text',    '') or '').strip()
 
     if not title or not text:
         raise ValueError("ИИ вернул пустой заголовок или текст.")
 
-    if len(preview) > PREVIEW_MAX_LEN:
-        preview = preview[:PREVIEW_MAX_LEN].rsplit(' ', 1)[0].rstrip('.,;:') + '...'
+    # Анонс почти повторяет заголовок — один раз просим переписать с конкретным замечанием.
+    if preview_too_similar(title, preview):
+        log.info("Анонс слишком похож на заголовок (%.2f) — переписываю", similarity(title, preview))
+        try:
+            preview = regenerate_preview(text, model_api, model_name,
+                                         title=title, previous=preview)
+        except Exception as exc:
+            log.warning("Не удалось переписать анонс: %s", exc)
 
-    return title, preview, text
+    return title, fit_preview(preview), text
 
 
 # ─────────────────────────────────────────────
 #  ИИ — ПЕРЕГЕНЕРАЦИЯ ЗАГОЛОВКА
 # ─────────────────────────────────────────────
 
-def regenerate_title(current_text: str, model_api: str, model_name: str) -> str:
+def regenerate_title(current_text: str, model_api: str, model_name: str,
+                     previous: str = "") -> str:
+    prev_rule = (f"- Не повторяй предыдущий вариант: «{previous}»\n" if previous else "")
     prompt = f"""
 Ты — редактор пресс-службы ОАО «Доломит».
 Придумай НОВЫЙ вариант заголовка для следующего текста новости.
 
 ПРАВИЛА:
-- Строго 1 короткое предложение
-- Используй кавычки «елочки», не заменяй их на ""
-- Не повторяй предыдущий заголовок
-- Заголовок должен быть ёмким и информативным
+- Строго 1 короткое предложение, в конце точка или восклицательный знак
+- Используй кавычки «ёлочки», не заменяй их на ""
+{prev_rule}- Заголовок должен быть ёмким и информативным
 
 Текст новости:
 {current_text}
 
-Ответь ТОЛЬКО заголовком, без кавычек, пояснений и JSON.
+Ответь ТОЛЬКО заголовком, без кавычек вокруг него, пояснений и JSON.
 """
-    response = client.models.generate_content(model=model_api, contents=prompt)
-    log_request(model_name, 'title')
-    return response.text.strip().strip('"').strip("'")
+    result = _generate(prompt, model_api, model_name, 'title')
+    return result.strip().strip('"').strip("'")
 
 
 # ─────────────────────────────────────────────
 #  ИИ — ПЕРЕГЕНЕРАЦИЯ АНОНСА
 # ─────────────────────────────────────────────
 
-def regenerate_preview(current_text: str, model_api: str, model_name: str) -> str:
+def regenerate_preview(current_text: str, model_api: str, model_name: str,
+                       title: str = "", previous: str = "") -> str:
+    extra = ""
+    if title:
+        extra += f"\nЗаголовок новости (анонс НЕ должен его повторять): {title}\n"
+    if previous:
+        extra += (f"\nПредыдущий вариант анонса (не подходит — слишком похож на заголовок "
+                  f"или повторяет его): {previous}\n")
     prompt = f"""
 Ты — редактор пресс-службы ОАО «Доломит».
 Напиши НОВЫЙ вариант анонса для следующей новости.
 
-ПРАВИЛА:
-- Строго 1-2 предложения, не более {PREVIEW_MAX_LEN} символов
-- Используй кавычки «елочки»
-- Анонс — это самостоятельный элемент, НЕ первое предложение текста
-- Не повторяй предыдущий анонс
-
+{_PREVIEW_RULES.format(max_len=PREVIEW_MAX_LEN)}
+{extra}
 Текст новости:
 {current_text}
 
 Ответь ТОЛЬКО анонсом, без пояснений и JSON.
 """
-    response = client.models.generate_content(model=model_api, contents=prompt)
-    log_request(model_name, 'preview')
-    result = response.text.strip().strip('"').strip("'")
-    if len(result) > PREVIEW_MAX_LEN:
-        result = result[:PREVIEW_MAX_LEN].rsplit(' ', 1)[0] + '...'
-    return result
+    result = _generate(prompt, model_api, model_name, 'preview')
+    return fit_preview(result.strip().strip('"').strip("'"))
 
 
 # ─────────────────────────────────────────────
 #  HTML / ФОРМАТИРОВАНИЕ
 # ─────────────────────────────────────────────
+
+def html_to_text(html: str) -> str:
+    """HTML новости -> обычный текст с абзацами (для запросов к ИИ: без лишних тегов)."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    paras = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+    paras = [p for p in paras if p]
+    return "\n\n".join(paras) if paras else soup.get_text(" ", strip=True)
+
 
 def inject_font_size(html_text: str) -> str:
     def wrap_paragraph(match):
@@ -380,173 +653,94 @@ def download_image_thumbnail(url: str, size: tuple = (240, 160)) -> Image.Image 
 
 
 # ─────────────────────────────────────────────
-#  ПЕРЕВОД НА БЕЛОРУССКИЙ
+#  ПЕРЕВОД НА БЕЛОРУССКИЙ (через ИИ)
+#  Один запрос на всю новость: заголовок + анонс + текст вместе, чтобы терминология
+#  и имена были согласованы. Разметка проверяется кодом: если ИИ испортил теги или
+#  вернул русский текст — один повторный запрос с указанием ошибки.
 # ─────────────────────────────────────────────
-#
-# GoogleTranslator из deep_translator - это НЕ официальный API, а обёртка
-# над бесплатным виджетом translate.google.com. У него негласный и довольно
-# низкий лимит запросов, и после нескольких быстрых запросов подряд Google
-# начинает отвечать 429 (TooManyRequests) на некоторое время (обычно от
-# десятков секунд до нескольких минут). Поэтому ниже сделано три вещи:
-#   1. Кэш переводов на диске - одинаковый текст (шаблонные фразы, имена,
-#      должности, повторяющиеся в новостях организации) переводится только
-#      один раз и берётся из кэша при повторе.
-#   2. Общий "тормоз" между запросами - гарантированная пауза между ЛЮБЫМИ
-#      двумя обращениями к Google, а не только внутри одного html.
-#   3. Ограниченный retry (2 попытки) + бан-кулдаун на Google, чтобы не
-#      тратить время на заведомо провальные запросы, и цепочка резервных
-#      переводчиков: MyMemory, а если и он не отвечает - LibreTranslate.
 
-TRANSLATION_CACHE_FILE = "data/translation_cache.json"
+_TRANSLATE_PROMPT = """\
+Ты — профессиональный переводчик и редактор с русского на белорусский язык. \
+Переведи новость для официального сайта ОАО «Доломит».
 
-_translation_cache: dict[str, str] = {}
-_cache_loaded = False
+ТРЕБОВАНИЯ:
+1. Литературный белорусский язык по действующим правилам (официальная орфография, «наркамаўка»), НЕ тарашкевица. Пиши естественно по-белорусски, а не калькой с русского: правильные предлоги, падежи и согласование, числительные, даты в белорусской форме («29 студзеня 2026 года»), чередование у/ва, з/са, і/й.
+2. HTML-разметку сохрани ТОЧНО: все теги и атрибуты (в том числе style="font-size: 15pt;") должны остаться без изменений, в том же количестве и порядке. Переводи только видимый текст между тегами.
+3. Кавычки — только «ёлочки», как в оригинале. Числа, телефоны, ссылки и слова латиницей не меняй.
+4. Имена и фамилии людей передавай по-белорусски (Иван Петров → Іван Пятроў). Географические названия — в белорусской форме (Витебск → Віцебск).
+5. Ничего не добавляй, не пропускай и не сокращай. Заголовок переводи как заголовок, анонс — как анонс (пустое поле оставь пустым).
+{glossary_rule}
+Верни ТОЛЬКО JSON-объект с полями title, preview, text.
+{retry_note}
+ИСХОДНЫЕ ДАННЫЕ (JSON):
+{payload}
+"""
 
-_last_translate_call = 0.0
-_MIN_INTERVAL = 1.2  # сек. между запросами к переводчику, чтобы не словить бан
-
-_google_banned_until = 0.0
-_GOOGLE_BAN_COOLDOWN = 300  # сек. — после подтверждённого бана не дёргаем Google это время
+_TAG_RE = re.compile(r'<[^>]+>')
 
 
-def _load_translation_cache() -> None:
-    global _cache_loaded
-    if _cache_loaded:
-        return
-    _cache_loaded = True
-    try:
-        if os.path.exists(TRANSLATION_CACHE_FILE):
-            with open(TRANSLATION_CACHE_FILE, "r", encoding="utf-8") as f:
-                _translation_cache.update(json.load(f))
-    except Exception:
-        log.warning("Не удалось загрузить кэш переводов, начинаем с пустого.")
+def _tags(html: str) -> list[str]:
+    return [re.sub(r'\s+', ' ', t).strip() for t in _TAG_RE.findall(html or "")]
 
 
-def _save_translation_cache() -> None:
-    try:
-        os.makedirs(os.path.dirname(TRANSLATION_CACHE_FILE), exist_ok=True)
-        with open(TRANSLATION_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_translation_cache, f, ensure_ascii=False)
-    except Exception:
-        log.warning("Не удалось сохранить кэш переводов.")
-
-
-def _throttle() -> None:
-    """Гарантирует паузу не меньше _MIN_INTERVAL между обращениями к сервису."""
-    global _last_translate_call
-    wait = _MIN_INTERVAL - (time.time() - _last_translate_call)
-    if wait > 0:
-        time.sleep(wait)
-    _last_translate_call = time.time()
-
-
-def _translate_via_libretranslate(text: str, fallback_exc: Exception | None = None) -> str:
-    """Третий резерв. Публичный libretranslate.com не всегда поддерживает
-    белорусский и часто требует платный api_key - для надёжности лучше
-    указать свой self-hosted URL в LIBRETRANSLATE_URL."""
-    from deep_translator import LibreTranslator
-    try:
-        _throttle()
-        kwargs = {"source": "ru", "target": "be", "base_url": LIBRETRANSLATE_URL}
-        if LIBRETRANSLATE_API_KEY:
-            kwargs["api_key"] = LIBRETRANSLATE_API_KEY
-        result = LibreTranslator(**kwargs).translate(text)
-        if not result:
-            raise ValueError("LibreTranslate вернул пустой ответ")
-        _translation_cache[text] = result
-        _save_translation_cache()
-        return result
-    except Exception as exc:
-        log.error("LibreTranslate тоже не смог перевести (%r): %s", text[:60], exc)
-        raise (fallback_exc or exc) from exc
-
-
-def _translate_via_mymemory(text: str, fallback_exc: Exception | None = None) -> str:
-    """Резервный перевод через MyMemory. Ошибки логируются явно, а не глотаются."""
-    from deep_translator import MyMemoryTranslator
-    try:
-        _throttle()
-        result = MyMemoryTranslator(source="ru-RU", target="be-BY").translate(text)
-        if not result:
-            raise ValueError("MyMemory вернул пустой ответ")
-        _translation_cache[text] = result
-        _save_translation_cache()
-        return result
-    except Exception as exc:
-        log.error("MyMemory тоже не смог перевести (%r): %s", text[:60], exc)
-        return _translate_via_libretranslate(text, fallback_exc or exc)
-
-
-def _translate_one(text: str) -> str:
+def _looks_belarusian(text: str) -> bool:
     """
-    Переводит одну строку ru→be с кэшем, троттлингом, ограниченным retry
-    и резервным переводчиком. Если Google подтверждённо забанен, следующие
-    _GOOGLE_BAN_COOLDOWN секунд идём сразу в MyMemory, не тратя время на
-    заведомо провальные попытки на каждом узле HTML.
+    В белорусском алфавите нет букв «и», «щ», «ъ». Если их заметная доля среди
+    кириллицы — ИИ, скорее всего, вернул русский текст. Короткие тексты не проверяем.
     """
-    global _google_banned_until
-    from deep_translator import GoogleTranslator
-    from deep_translator.exceptions import TooManyRequests
-
-    _load_translation_cache()
-    if text in _translation_cache:
-        return _translation_cache[text]
-
-    if time.time() < _google_banned_until:
-        return _translate_via_mymemory(text)
-
-    last_exc = None
-    for attempt in range(2):  # 2+4 = 6 сек максимум ожидания на узел, не 62
-        _throttle()
-        try:
-            result = GoogleTranslator(source="ru", target="be").translate(text)
-            _translation_cache[text] = result
-            _save_translation_cache()
-            return result
-        except TooManyRequests as exc:
-            last_exc = exc
-            wait = 2 * (2 ** attempt)
-            log.warning("Google Translate: 429, пауза %.0f с (попытка %d/2)",
-                        wait, attempt + 1)
-            time.sleep(wait)
-
-    # Google не ответил за 2 попытки - считаем забаненным на _GOOGLE_BAN_COOLDOWN
-    # секунд и в течение этого времени сразу идём в MyMemory, без повторных 429.
-    _google_banned_until = time.time() + _GOOGLE_BAN_COOLDOWN
-    log.warning("Google Translate забанен, пауза на %d с, переключаюсь на MyMemory.",
-                _GOOGLE_BAN_COOLDOWN)
-    return _translate_via_mymemory(text, last_exc)
+    plain = _TAG_RE.sub(' ', text or '').lower()
+    letters = re.findall(r'[а-яёіў]', plain)
+    if len(letters) < 150:
+        return True
+    foreign = sum(1 for ch in letters if ch in 'ищъ')
+    return foreign / len(letters) <= 0.02
 
 
-def _translate(text: str) -> str:
-    if not text or not text.strip():
-        return text
-    return _translate_one(text)
+def _translation_problem(src_html: str, out_html: str) -> str | None:
+    if _tags(src_html) != _tags(out_html):
+        return ("HTML-теги не совпадают с оригиналом: теги и атрибуты нужно сохранить "
+                "без изменений, в том же порядке и количестве")
+    if not _looks_belarusian(out_html):
+        return "в тексте остались русские слова (буквы «и», «щ», «ъ»): переведи ВСЁ на белорусский"
+    return None
 
 
-def _translate_html(html: str) -> str:
-    if not html or not html.strip():
-        return html
-    soup = BeautifulSoup(html, "html.parser")
-    for node in soup.find_all(string=True):
-        text = node.strip()
-        if text:
-            try:
-                translated = _translate_one(text)
-                if translated:
-                    node.replace_with(node.replace(text, translated))
-            except Exception as exc:
-                log.error("Не удалось перевести фрагмент (%r): %s", text[:60], exc)
-                # оставляем как есть, не рушим весь пост
-    return str(soup)
+def translate_to_belarusian(title: str, preview: str, html_text: str,
+                             model_api: str | None = None,
+                             model_name: str | None = None) -> tuple[str, str, str]:
+    """Переводит новость на белорусский одним запросом к ИИ. Возвращает (title, preview, text)."""
+    if not model_api or not model_name:
+        model_name, model_api = next(iter(MODELS.items()))
 
+    glossary = "\n".join(f"   - «{ru}» → «{by}»" for ru, by in TRANSLATION_GLOSSARY.items())
+    glossary_rule = (
+        "6. Устойчивые названия переводи строго так:\n" + glossary + "\n"
+    ) if glossary else ""
+    payload = json.dumps(
+        {"title": title, "preview": preview, "text": html_text}, ensure_ascii=False)
 
-def translate_to_belarusian(title: str, preview: str,
-                             html_text: str) -> tuple[str, str, str]:
-    title_by   = _translate(title)
-    preview_by = _translate(preview)
-    text_by    = _translate_html(html_text)
-    return title_by, preview_by, text_by
+    retry_note = ""
+    for attempt in range(2):
+        prompt = _TRANSLATE_PROMPT.format(
+            glossary_rule=glossary_rule, retry_note=retry_note, payload=payload)
+        raw  = _generate(prompt, model_api, model_name, 'translate', json_mode=True)
+        data = _parse_json(raw)
+
+        t_by = str(data.get('title',   '') or '').strip()
+        p_by = str(data.get('preview', '') or '').strip()
+        x_by = str(data.get('text',    '') or '').strip()
+
+        if not t_by or (html_text.strip() and not x_by):
+            problem = "пустой заголовок или текст в ответе"
+        else:
+            problem = _translation_problem(html_text, x_by)
+        if problem is None:
+            return t_by, fit_preview(p_by), x_by
+
+        log.warning("Перевод не прошёл проверку (попытка %d/2): %s", attempt + 1, problem)
+        retry_note = f"\nВНИМАНИЕ: в предыдущем ответе была ошибка — {problem}. Исправь её.\n"
+
+    raise ValueError(f"ИИ не смог корректно перевести текст: {problem}")
 
 
 # ─────────────────────────────────────────────
