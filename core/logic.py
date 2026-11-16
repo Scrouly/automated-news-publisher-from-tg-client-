@@ -15,6 +15,8 @@ import requests
 from bs4 import BeautifulSoup
 from dataclasses import dataclass, field
 from datetime import datetime
+from html import escape as _html_escape
+from html import unescape as _html_unescape
 from urllib.parse import urlparse
 from PIL import Image
 from google import genai
@@ -22,7 +24,7 @@ from google import genai
 from core.config import (
     SECRET_TOKEN, BITRIX_API_URL, GEMINI_API_KEY,
     LOG_FILE, REQUESTS_LOG, DAILY_LIMIT, DAILY_LIMITS, PREVIEW_MAX_LEN, DRAFT_FILE,
-    MODELS, TRANSLATION_GLOSSARY,
+    MODELS, THINKING_LEVEL, TRANSLATION_GLOSSARY,
 )
 
 log = logging.getLogger(__name__)
@@ -353,6 +355,10 @@ def fetch_posts(urls: list[str]) -> MergedPost:
 
 _RETRYABLE_CODES = (429, 500, 502, 503, 504)
 
+# Если SDK или модель не принимает thinking_level — отключаем этот параметр до
+# конца работы программы (запросы идут с размышлениями по умолчанию, но не падают).
+_thinking_disabled = False
+
 
 def _parse_json(raw: str) -> dict:
     try:
@@ -370,38 +376,69 @@ def _parse_json(raw: str) -> dict:
     return data
 
 
+def _build_config(json_mode: bool) -> dict:
+    cfg: dict = {}
+    if json_mode:
+        cfg["response_mime_type"] = "application/json"
+    if THINKING_LEVEL and not _thinking_disabled:
+        cfg["thinking_config"] = {"thinking_level": THINKING_LEVEL}
+    return cfg
+
+
 def _generate(prompt: str, model_api: str, model_name: str,
               request_type: str, json_mode: bool = False) -> str:
     """
     Вызывает Gemini. Если выбранная модель ответила 429 (лимит) или 5xx — после
     одного повтора при 5xx переходит на следующую модель из MODELS. Модели, у которых
     исчерпан локальный дневной лимит, пропускаются. Запрос пишется в лог под именем
-    той модели, которая реально ответила.
+    той модели, которая реально ответила. Время и число токенов каждого запроса
+    пишутся в лог (data/app.log) — по ним видно, на что уходит время.
     """
+    global _thinking_disabled
+
     candidates = [(model_name, model_api)] + [
         (n, a) for n, a in MODELS.items() if a != model_api
     ]
-    kwargs = {"config": {"response_mime_type": "application/json"}} if json_mode else {}
 
     last_exc: Exception | None = None
     for name, api in candidates:
         if not check_limit(name)[0]:
             log.info("Пропускаю %s: локальный дневной лимит исчерпан", name)
             continue
-        for attempt in range(2):
+        attempt = 0
+        while attempt < 2:
+            cfg = _build_config(json_mode)
+            kwargs = {"config": cfg} if cfg else {}
+            started = time.monotonic()
             try:
                 response = client.models.generate_content(
                     model=api, contents=prompt, **kwargs)
             except Exception as exc:
                 last_exc = exc
                 code = getattr(exc, "code", None)
-                if code not in _RETRYABLE_CODES:
-                    raise
-                if code != 429 and attempt == 0:
-                    time.sleep(2)
+                if code in _RETRYABLE_CODES:
+                    if code != 429 and attempt == 0:
+                        attempt += 1
+                        time.sleep(2)
+                        continue
+                    log.warning("%s: ошибка %s — перехожу на следующую модель", name, code)
+                    break
+                if "thinking_config" in cfg and "thinking" in str(exc).lower():
+                    # Старый SDK или модель не знает thinking_level: пробуем без него.
+                    log.warning(
+                        "Параметр thinking_level не принят (%s: %s). Отключаю его; "
+                        "обновите SDK: pip install -U google-genai",
+                        type(exc).__name__, exc)
+                    _thinking_disabled = True
                     continue
-                log.warning("%s: ошибка %s — перехожу на следующую модель", name, code)
-                break
+                raise
+            elapsed = time.monotonic() - started
+            usage = getattr(response, "usage_metadata", None)
+            log.info("Gemini %s [%s]: %.1f с (вход %s, мысли %s, ответ %s ток.)",
+                     name, request_type, elapsed,
+                     getattr(usage, "prompt_token_count", "?"),
+                     getattr(usage, "thoughts_token_count", "?"),
+                     getattr(usage, "candidates_token_count", "?"))
             log_request(name, request_type)
             text = getattr(response, "text", None)
             if not text or not text.strip():
@@ -655,8 +692,10 @@ def download_image_thumbnail(url: str, size: tuple = (240, 160)) -> Image.Image 
 # ─────────────────────────────────────────────
 #  ПЕРЕВОД НА БЕЛОРУССКИЙ (через ИИ)
 #  Один запрос на всю новость: заголовок + анонс + текст вместе, чтобы терминология
-#  и имена были согласованы. Разметка проверяется кодом: если ИИ испортил теги или
-#  вернул русский текст — один повторный запрос с указанием ошибки.
+#  и имена были согласованы. HTML ИИ не видит: код вынимает из него текстовые
+#  фрагменты, отдаёт их списком и вставляет переводы обратно. Поэтому теги и
+#  атрибуты гарантированно не портятся, а ответ короче (нет разметки в токенах).
+#  Если ИИ вернул не то количество фрагментов или русский текст — один повтор.
 # ─────────────────────────────────────────────
 
 _TRANSLATE_PROMPT = """\
@@ -665,22 +704,39 @@ _TRANSLATE_PROMPT = """\
 
 ТРЕБОВАНИЯ:
 1. Литературный белорусский язык по действующим правилам (официальная орфография, «наркамаўка»), НЕ тарашкевица. Пиши естественно по-белорусски, а не калькой с русского: правильные предлоги, падежи и согласование, числительные, даты в белорусской форме («29 студзеня 2026 года»), чередование у/ва, з/са, і/й.
-2. HTML-разметку сохрани ТОЧНО: все теги и атрибуты (в том числе style="font-size: 15pt;") должны остаться без изменений, в том же количестве и порядке. Переводи только видимый текст между тегами.
+2. Поле fragments — последовательные части ОДНОГО текста (абзацы или куски абзацев между HTML-тегами; сами теги тебе не передаются). Переведи каждый фрагмент и верни список fragments ТОЧНО той же длины и в том же порядке: ничего не объединяй, не разделяй, не пропускай и не переставляй. Первый и последний символы-пробелы фрагментов сохраняй.
 3. Кавычки — только «ёлочки», как в оригинале. Числа, телефоны, ссылки и слова латиницей не меняй.
 4. Имена и фамилии людей передавай по-белорусски (Иван Петров → Іван Пятроў). Географические названия — в белорусской форме (Витебск → Віцебск).
-5. Ничего не добавляй, не пропускай и не сокращай. Заголовок переводи как заголовок, анонс — как анонс (пустое поле оставь пустым).
+5. Ничего не добавляй и не сокращай. Заголовок переводи как заголовок, анонс — как анонс (пустое поле оставь пустым).
 {glossary_rule}
-Верни ТОЛЬКО JSON-объект с полями title, preview, text.
+Верни ТОЛЬКО JSON-объект с полями title, preview, fragments.
 {retry_note}
 ИСХОДНЫЕ ДАННЫЕ (JSON):
 {payload}
 """
 
-_TAG_RE = re.compile(r'<[^>]+>')
+
+_TAG_SPLIT = re.compile(r'(<[^>]*>)')
 
 
-def _tags(html: str) -> list[str]:
-    return [re.sub(r'\s+', ' ', t).strip() for t in _TAG_RE.findall(html or "")]
+def _split_html(html: str) -> tuple[list[str], list[int]]:
+    """
+    Режет HTML на части: чётные индексы — текст, нечётные — теги (и комментарии).
+    Возвращает (части, индексы текстовых частей, которые нужно переводить).
+    Пробельные части, содержимое script/style и комментарии не переводятся.
+    """
+    parts = _TAG_SPLIT.split(html or "")
+    idx: list[int] = []
+    skip: str | None = None
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            m = re.match(r'<\s*(/?)\s*(script|style)\b', part, re.IGNORECASE)
+            if m:
+                skip = None if m.group(1) else m.group(2).lower()
+            continue
+        if skip is None and _html_unescape(part).strip():
+            idx.append(i)
+    return parts, idx
 
 
 def _looks_belarusian(text: str) -> bool:
@@ -688,7 +744,7 @@ def _looks_belarusian(text: str) -> bool:
     В белорусском алфавите нет букв «и», «щ», «ъ». Если их заметная доля среди
     кириллицы — ИИ, скорее всего, вернул русский текст. Короткие тексты не проверяем.
     """
-    plain = _TAG_RE.sub(' ', text or '').lower()
+    plain = re.sub(r'<[^>]+>', ' ', text or '').lower()
     letters = re.findall(r'[а-яёіў]', plain)
     if len(letters) < 150:
         return True
@@ -696,11 +752,15 @@ def _looks_belarusian(text: str) -> bool:
     return foreign / len(letters) <= 0.02
 
 
-def _translation_problem(src_html: str, out_html: str) -> str | None:
-    if _tags(src_html) != _tags(out_html):
-        return ("HTML-теги не совпадают с оригиналом: теги и атрибуты нужно сохранить "
-                "без изменений, в том же порядке и количестве")
-    if not _looks_belarusian(out_html):
+def _fragments_problem(src: list[str], out) -> str | None:
+    if not isinstance(out, list) or not all(isinstance(x, str) for x in out):
+        return "поле fragments должно быть списком строк"
+    if len(out) != len(src):
+        return (f"в fragments {len(out)} элементов, а в исходных данных {len(src)}: "
+                "верни список ТОЧНО той же длины, ничего не объединяя и не пропуская")
+    if any(not o.strip() for o in out):
+        return "среди fragments есть пустые элементы: переведи каждый фрагмент"
+    if not _looks_belarusian(" ".join(out)):
         return "в тексте остались русские слова (буквы «и», «щ», «ъ»): переведи ВСЁ на белорусский"
     return None
 
@@ -712,14 +772,18 @@ def translate_to_belarusian(title: str, preview: str, html_text: str,
     if not model_api or not model_name:
         model_name, model_api = next(iter(MODELS.items()))
 
+    parts, idx = _split_html(html_text)
+    src = [_html_unescape(parts[i]).strip() for i in idx]
+
     glossary = "\n".join(f"   - «{ru}» → «{by}»" for ru, by in TRANSLATION_GLOSSARY.items())
     glossary_rule = (
         "6. Устойчивые названия переводи строго так:\n" + glossary + "\n"
     ) if glossary else ""
     payload = json.dumps(
-        {"title": title, "preview": preview, "text": html_text}, ensure_ascii=False)
+        {"title": title, "preview": preview, "fragments": src}, ensure_ascii=False)
 
     retry_note = ""
+    problem = ""
     for attempt in range(2):
         prompt = _TRANSLATE_PROMPT.format(
             glossary_rule=glossary_rule, retry_note=retry_note, payload=payload)
@@ -728,14 +792,22 @@ def translate_to_belarusian(title: str, preview: str, html_text: str,
 
         t_by = str(data.get('title',   '') or '').strip()
         p_by = str(data.get('preview', '') or '').strip()
-        x_by = str(data.get('text',    '') or '').strip()
+        frags = data.get('fragments')
+        if frags is None and not src:
+            frags = []
 
-        if not t_by or (html_text.strip() and not x_by):
-            problem = "пустой заголовок или текст в ответе"
+        if not t_by:
+            problem = "пустой заголовок в ответе"
         else:
-            problem = _translation_problem(html_text, x_by)
-        if problem is None:
-            return t_by, fit_preview(p_by), x_by
+            problem = _fragments_problem(src, frags) or ""
+        if not problem:
+            out_parts = list(parts)
+            for i, new in zip(idx, frags):
+                raw   = parts[i]
+                lead  = raw[:len(raw) - len(raw.lstrip())]
+                trail = raw[len(raw.rstrip()):]
+                out_parts[i] = lead + _html_escape(new.strip(), quote=False) + trail
+            return t_by, fit_preview(p_by), "".join(out_parts)
 
         log.warning("Перевод не прошёл проверку (попытка %d/2): %s", attempt + 1, problem)
         retry_note = f"\nВНИМАНИЕ: в предыдущем ответе была ошибка — {problem}. Исправь её.\n"

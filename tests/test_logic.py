@@ -506,8 +506,10 @@ class _GenerateBase(unittest.TestCase):
         self._patch_sleep.start()
         self.names = list(logic.MODELS.keys())
         self.apis  = list(logic.MODELS.values())
+        logic._thinking_disabled = False
 
     def tearDown(self):
+        logic._thinking_disabled = False
         self._patch_client.stop()
         self._patch_sleep.stop()
         logic.REQUESTS_LOG = self._orig_req
@@ -528,6 +530,40 @@ class TestGenerate(_GenerateBase):
         logic._generate("p", self.apis[0], self.names[0], "full", json_mode=True)
         kwargs = self.client.models.generate_content.call_args.kwargs
         self.assertEqual(kwargs["config"]["response_mime_type"], "application/json")
+
+    def test_thinking_level_is_passed(self):
+        self.client.models.generate_content.return_value = _resp("ok")
+        logic._generate("p", self.apis[0], self.names[0], "title")
+        cfg = self.client.models.generate_content.call_args.kwargs["config"]
+        self.assertEqual(cfg["thinking_config"]["thinking_level"], logic.THINKING_LEVEL)
+        self.assertNotIn("response_mime_type", cfg)
+
+    def test_thinking_not_passed_when_disabled_in_config(self):
+        self.client.models.generate_content.return_value = _resp("ok")
+        with patch.object(logic, "THINKING_LEVEL", None):
+            logic._generate("p", self.apis[0], self.names[0], "title")
+        self.assertNotIn("config", self.client.models.generate_content.call_args.kwargs)
+
+    def test_rejected_thinking_param_retries_without_it(self):
+        # старый SDK: pydantic ValidationError (ValueError) с упоминанием thinking_level
+        self.client.models.generate_content.side_effect = [
+            ValueError("1 validation error: thinking_level extra inputs are not permitted"),
+            _resp("ok"),
+        ]
+        out = logic._generate("p", self.apis[0], self.names[0], "full", json_mode=True)
+        self.assertEqual(out, "ok")
+        calls = self.client.models.generate_content.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertIn("thinking_config", calls[0].kwargs["config"])
+        self.assertNotIn("thinking_config", calls[1].kwargs["config"])
+        self.assertIn("response_mime_type", calls[1].kwargs["config"])   # JSON-режим сохранён
+        self.assertTrue(logic._thinking_disabled)
+
+    def test_unrelated_error_does_not_disable_thinking(self):
+        self.client.models.generate_content.side_effect = FakeApiError(400)
+        with self.assertRaises(FakeApiError):
+            logic._generate("p", self.apis[0], self.names[0], "full")
+        self.assertFalse(logic._thinking_disabled)
 
     def test_429_switches_to_next_model(self):
         self.client.models.generate_content.side_effect = [
@@ -694,52 +730,96 @@ class TestRegenerate(_GenerateBase):
 # ─────────────────────────────────────────────
 
 SRC_HTML = ('<p>\n\t<span style="font-size: 15pt;">Работники приняли участие в акции.'
-            '</span>\n</p>')
-BY_HTML  = ('<p>\n\t<span style="font-size: 15pt;">Работнікі прынялі ўдзел у акцыі.'
-            '</span>\n</p>')
+            '</span>\n</p>'
+            '<p>\n\t<span style="font-size: 15pt;">Второй <b>важный</b> абзац.</span>\n</p>')
+SRC_FRAGS = ["Работники приняли участие в акции.", "Второй", "важный", "абзац."]
+BY_FRAGS  = ["Работнікі прынялі ўдзел у акцыі.", "Другі", "важны", "абзац."]
 BY_OK = {"title": "Работнікі ААТ «Даламіт» ўшанавалі памяць.",
-         "preview": "Падрабязнасці ўнутры.", "text": BY_HTML}
+         "preview": "Падрабязнасці ўнутры.", "fragments": BY_FRAGS}
+BY_HTML = ('<p>\n\t<span style="font-size: 15pt;">Работнікі прынялі ўдзел у акцыі.'
+           '</span>\n</p>'
+           '<p>\n\t<span style="font-size: 15pt;">Другі <b>важны</b> абзац.</span>\n</p>')
 
 
 class TestTranslate(_GenerateBase):
 
-    def _translate(self):
+    def _translate(self, html=SRC_HTML):
         return translate_to_belarusian(
             "Работники ОАО «Доломит» почтили память.", "Подробности внутри.",
-            SRC_HTML, self.apis[0], self.names[0])
+            html, self.apis[0], self.names[0])
+
+    def _prompt(self, n=0):
+        return self.client.models.generate_content.call_args_list[n].kwargs["contents"]
 
     def test_one_request_for_whole_news(self):
         self.client.models.generate_content.return_value = _resp(json.dumps(BY_OK))
         t, p, x = self._translate()
-        self.assertEqual((t, p, x), (BY_OK["title"], BY_OK["preview"], BY_OK["text"]))
+        self.assertEqual(t, BY_OK["title"])
+        self.assertEqual(p, BY_OK["preview"])
+        self.assertEqual(x, BY_HTML)
         self.assertEqual(self.client.models.generate_content.call_count, 1)
         self.assertEqual(logic.get_today_usage(), {self.names[0]: 1})
 
-    def test_prompt_has_glossary_and_source(self):
+    def test_ai_sees_only_text_fragments_not_markup(self):
         self.client.models.generate_content.return_value = _resp(json.dumps(BY_OK))
         self._translate()
-        prompt = self.client.models.generate_content.call_args.kwargs["contents"]
-        for ru, by in logic.TRANSLATION_GLOSSARY.items():
-            self.assertIn(ru, prompt)
-            self.assertIn(by, prompt)
-        self.assertIn("Подробности внутри.", prompt)
+        prompt = self._prompt()
+        self.assertIn("Работники приняли участие в акции.", prompt)
+        self.assertNotIn("font-size", prompt)
+        self.assertNotIn("<span", prompt)
 
-    def test_broken_tags_trigger_one_retry(self):
-        broken = dict(BY_OK, text="<p>Работнікі прынялі ўдзел у акцыі.</p>")
+    def test_html_is_untouched_except_text(self):
+        self.client.models.generate_content.return_value = _resp(json.dumps(BY_OK))
+        _, _, x = self._translate()
+        import re
+        self.assertEqual(re.findall(r"<[^>]+>", x), re.findall(r"<[^>]+>", SRC_HTML))
+        self.assertIn("\n\t", x)                 # пробелы между тегами сохранены побайтово
+
+    def test_entities_roundtrip(self):
+        html = "<p>Пётр&nbsp;и &amp; Ко</p>"
+        self.client.models.generate_content.return_value = _resp(json.dumps(
+            {"title": "З.", "preview": "", "fragments": ["Пётр і & Ко"]}))
+        _, _, x = translate_to_belarusian("З.", "", html, self.apis[0], self.names[0])
+        self.assertEqual(x, "<p>Пётр і &amp; Ко</p>")
+        self.assertIn("Пётр\xa0и & Ко", self._prompt())      # ИИ получает обычный текст, не сущности
+
+    def test_leading_and_trailing_spaces_kept(self):
+        html = "<p>Начало <b>жирный</b> конец</p>"
+        self.client.models.generate_content.return_value = _resp(json.dumps(
+            {"title": "З.", "preview": "", "fragments": ["Пачатак", "тоўсты", "канец"]}))
+        _, _, x = translate_to_belarusian("З.", "", html, self.apis[0], self.names[0])
+        self.assertEqual(x, "<p>Пачатак <b>тоўсты</b> канец</p>")
+
+    def test_prompt_has_glossary(self):
+        self.client.models.generate_content.return_value = _resp(json.dumps(BY_OK))
+        self._translate()
+        for ru, by in logic.TRANSLATION_GLOSSARY.items():
+            self.assertIn(ru, self._prompt())
+            self.assertIn(by, self._prompt())
+
+    def test_wrong_fragment_count_triggers_one_retry(self):
+        short = dict(BY_OK, fragments=BY_FRAGS[:2])
         self.client.models.generate_content.side_effect = [
-            _resp(json.dumps(broken)), _resp(json.dumps(BY_OK)),
+            _resp(json.dumps(short)), _resp(json.dumps(BY_OK)),
         ]
         _, _, x = self._translate()
         self.assertEqual(x, BY_HTML)
         self.assertEqual(self.client.models.generate_content.call_count, 2)
-        retry_prompt = self.client.models.generate_content.call_args_list[1].kwargs["contents"]
-        self.assertIn("HTML-теги", retry_prompt)
+        self.assertIn("ТОЧНО той же длины", self._prompt(1))
 
-    def test_still_broken_after_retry_raises(self):
-        broken = dict(BY_OK, text="<p>Работнікі прынялі ўдзел.</p>")
-        self.client.models.generate_content.return_value = _resp(json.dumps(broken))
+    def test_still_wrong_after_retry_raises(self):
+        short = dict(BY_OK, fragments=BY_FRAGS[:2])
+        self.client.models.generate_content.return_value = _resp(json.dumps(short))
         with self.assertRaises(ValueError):
             self._translate()
+        self.assertEqual(self.client.models.generate_content.call_count, 2)
+
+    def test_empty_fragment_triggers_retry(self):
+        bad = dict(BY_OK, fragments=["", *BY_FRAGS[1:]])
+        self.client.models.generate_content.side_effect = [
+            _resp(json.dumps(bad)), _resp(json.dumps(BY_OK)),
+        ]
+        self._translate()
         self.assertEqual(self.client.models.generate_content.call_count, 2)
 
     def test_empty_title_triggers_retry(self):
@@ -756,6 +836,25 @@ class TestTranslate(_GenerateBase):
             "Заголовок.", "", SRC_HTML, self.apis[0], self.names[0])
         self.assertEqual(p, "")
 
+    def test_html_without_text(self):
+        self.client.models.generate_content.return_value = _resp(
+            json.dumps({"title": "Загаловак.", "preview": "", "fragments": []}))
+        t, _, x = translate_to_belarusian("Заголовок.", "", "<p> </p>",
+                                          self.apis[0], self.names[0])
+        self.assertEqual(t, "Загаловак.")
+        self.assertEqual(x, "<p> </p>")
+
+    def test_comments_and_scripts_are_not_sent(self):
+        html = "<!-- заметка --><p>Текст.</p><script>var a = 1;</script>"
+        self.client.models.generate_content.return_value = _resp(
+            json.dumps({"title": "З.", "preview": "", "fragments": ["Тэкст."]}))
+        _, _, x = translate_to_belarusian("З.", "", html, self.apis[0], self.names[0])
+        self.assertNotIn("заметка", self._prompt())
+        self.assertNotIn("var a", self._prompt())
+        self.assertIn("<!-- заметка -->", x)
+        self.assertIn("var a = 1;", x)
+        self.assertIn("Тэкст.", x)
+
     def test_defaults_to_first_model(self):
         self.client.models.generate_content.return_value = _resp(json.dumps(BY_OK))
         translate_to_belarusian("З.", "А.", SRC_HTML)
@@ -763,7 +862,7 @@ class TestTranslate(_GenerateBase):
                          self.apis[0])
 
 
-class TestBelarusianChecks(unittest.TestCase):
+class TestBelarusianCheck(unittest.TestCase):
 
     RU_LONG = ("Работники предприятия приняли участие в праздничных мероприятиях и "
                "подвели итоги работы за год, отметив лучших сотрудников. " * 3)
@@ -783,13 +882,14 @@ class TestBelarusianChecks(unittest.TestCase):
         self.assertTrue(logic._looks_belarusian(
             '<p><span style="font-size: 15pt;">' + self.BY_LONG + '</span></p>'))
 
-    def test_tag_comparison_ignores_text_and_whitespace(self):
-        a = '<p>\n<span style="font-size:  15pt;">Один</span>\n</p>'
-        b = '<p><span style="font-size: 15pt;">Адзін</span></p>'
-        self.assertIsNone(logic._translation_problem(a, b))
+    def test_russian_fragments_rejected_as_problem(self):
+        src = ["а"] * 3
+        out = [self.RU_LONG, self.RU_LONG, self.RU_LONG]
+        self.assertIsNotNone(logic._fragments_problem(src, out))
 
-    def test_tag_mismatch_reported(self):
-        self.assertIsNotNone(logic._translation_problem("<p>a</p>", "<p><b>a</b></p>"))
+    def test_fragments_must_be_list_of_strings(self):
+        self.assertIsNotNone(logic._fragments_problem(["а"], "строка"))
+        self.assertIsNotNone(logic._fragments_problem(["а"], [1]))
 
 
 if __name__ == "__main__":

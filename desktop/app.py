@@ -4,7 +4,9 @@
 """
 
 import io
+import logging
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from tkinter import messagebox, ttk
@@ -12,7 +14,7 @@ from tkinter import messagebox, ttk
 import requests
 from PIL import Image, ImageTk
 
-from core.config import C, MODELS, PREVIEW_MAX_LEN
+from core.config import C, DATA_DIR, MODELS, PREVIEW_MAX_LEN
 from desktop.dialogs import PhotoPickerDialog, HistoryDialog
 from core.logic import (
     parse_tg_urls, find_duplicates, log_publication,
@@ -174,6 +176,8 @@ class App(tk.Tk):
         # Перевод на белорусский
         self._tr_seq            = 0      # номер запроса: ответы устаревших запросов игнорируются
         self._tr_src            = None   # (title, preview, text), с которого начат перевод
+        self._tr_started        = 0.0    # когда начат текущий перевод (для счётчика секунд)
+        self._fetch_started     = 0.0
         self._translating       = False
         self._translation_fresh = False  # BY-перевод соответствует текущему RU
         self._by_edited         = False  # BY-версию правили руками
@@ -724,6 +728,7 @@ class App(tk.Tk):
                 self._warn_dup.config(
                     text=f"⚠  Уже публиковалось постов: {len(dups)} из {len(urls)}")
 
+        self._fetch_started = time.monotonic()
         n = len(urls)
         self._loading(True, "Загружаю пост из Telegram..." if n == 1
                       else f"Загружаю посты из Telegram (0 из {n})...")
@@ -814,7 +819,8 @@ class App(tk.Tk):
         self._update_card()
         self._save_draft()
         extra = (f" Постов объединено: {merged.text_posts}." if merged.text_posts > 1 else "")
-        self._status(f"Готово.{extra} Фото: {len(self._image_urls)}", "success")
+        took = time.monotonic() - self._fetch_started
+        self._status(f"Готово за {took:.0f} с.{extra} Фото: {len(self._image_urls)}", "success")
 
         if self._publish_by_var.get():
             self._start_translate(title, preview, html)
@@ -951,21 +957,32 @@ class App(tk.Tk):
         seq = self._tr_seq
         self._tr_src = (title, preview, html)
         self._translating = True
+        self._tr_started = time.monotonic()
         self._retranslate_btn.set_enabled(False)
         self._by_status.config(text="⏳ Перевожу на белорусский (ИИ)...", fg=C["accent"])
+        self.after(1000, self._tick_translate, seq)
         mn, ma = self._get_model()
         threading.Thread(
             target=self._do_translate, args=(seq, title, preview, html, ma, mn), daemon=True
         ).start()
 
+    def _tick_translate(self, seq):
+        """Раз в секунду показывает, сколько секунд уже идёт перевод."""
+        if self._translating and seq == self._tr_seq:
+            sec = int(time.monotonic() - self._tr_started)
+            self._by_status.config(text=f"⏳ Перевожу на белорусский (ИИ)... {sec} с",
+                                   fg=C["accent"])
+            self.after(1000, self._tick_translate, seq)
+
     def _do_translate(self, seq, title, preview, html, ma, mn):
+        started = time.monotonic()
         try:
             tb, pb, xb = translate_to_belarusian(title, preview, html, ma, mn)
-            self.after(0, self._translate_done, seq, tb, pb, xb)
+            self.after(0, self._translate_done, seq, tb, pb, xb, time.monotonic() - started)
         except Exception as ex:
             self.after(0, self._translate_failed, seq, str(ex))
 
-    def _translate_done(self, seq, tb, pb, xb):
+    def _translate_done(self, seq, tb, pb, xb, elapsed=None):
         if seq != self._tr_seq:       # пока шёл перевод, загрузили другой пост или сбросили форму
             return
         self._translating = False
@@ -984,8 +1001,10 @@ class App(tk.Tk):
             and (ru["title"], ru["preview"], ru["text"]) == tuple(self._tr_src)
         )
         if self._translation_fresh:
-            self._by_status.config(text="✓ Перевод готов — проверьте вкладку «Беларускі»",
-                                   fg=C["success"])
+            took = f" за {elapsed:.0f} с" if elapsed is not None else ""
+            self._by_status.config(
+                text=f"✓ Перевод готов{took} — проверьте вкладку «Беларускі»",
+                fg=C["success"])
         else:
             self._mark_translation_stale(force=True)
         self._save_draft()
@@ -1197,7 +1216,21 @@ class App(tk.Tk):
         self._status("Готов к работе")
 
 
+def _setup_logging():
+    """Лог в консоль и в data/app.log: там время и число токенов каждого запроса к ИИ."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(name)-16s  %(levelname)-7s  %(message)s",
+        datefmt="%d.%m.%Y %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(f"{DATA_DIR}/app.log", encoding="utf-8"),
+        ],
+    )
+
+
 def main():
+    _setup_logging()
     app = App()
     app.mainloop()
 
