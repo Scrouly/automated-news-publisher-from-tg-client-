@@ -506,10 +506,10 @@ class _GenerateBase(unittest.TestCase):
         self._patch_sleep.start()
         self.names = list(logic.MODELS.keys())
         self.apis  = list(logic.MODELS.values())
-        logic._thinking_disabled = False
+        logic._disabled_options.clear()
 
     def tearDown(self):
-        logic._thinking_disabled = False
+        logic._disabled_options.clear()
         self._patch_client.stop()
         self._patch_sleep.stop()
         logic.REQUESTS_LOG = self._orig_req
@@ -542,7 +542,53 @@ class TestGenerate(_GenerateBase):
         self.client.models.generate_content.return_value = _resp("ok")
         with patch.object(logic, "THINKING_LEVEL", None):
             logic._generate("p", self.apis[0], self.names[0], "title")
+        cfg = self.client.models.generate_content.call_args.kwargs["config"]
+        self.assertNotIn("thinking_config", cfg)
+
+    def test_no_config_at_all_when_everything_disabled(self):
+        self.client.models.generate_content.return_value = _resp("ok")
+        with patch.object(logic, "THINKING_LEVEL", None), \
+                patch.object(logic, "REQUEST_TIMEOUT", None):
+            logic._generate("p", self.apis[0], self.names[0], "title")
         self.assertNotIn("config", self.client.models.generate_content.call_args.kwargs)
+
+    def test_timeout_passed_in_ms_and_doubled_for_full(self):
+        self.client.models.generate_content.return_value = _resp("ok")
+        with patch.object(logic, "REQUEST_TIMEOUT", 40):
+            logic._generate("p", self.apis[0], self.names[0], "translate")
+            logic._generate("p", self.apis[0], self.names[0], "full")
+        calls = self.client.models.generate_content.call_args_list
+        self.assertEqual(calls[0].kwargs["config"]["http_options"]["timeout"], 40000)
+        self.assertEqual(calls[1].kwargs["config"]["http_options"]["timeout"], 80000)
+
+    def test_hung_request_is_retried_on_same_model(self):
+        self.client.models.generate_content.side_effect = [TimeoutError("hung"), _resp("ok")]
+        self.assertEqual(logic._generate("p", self.apis[0], self.names[0], "full"), "ok")
+        used = [c.kwargs["model"] for c in self.client.models.generate_content.call_args_list]
+        self.assertEqual(used, [self.apis[0], self.apis[0]])
+
+    def test_httpx_style_timeout_is_recognised_by_name(self):
+        class ReadTimeout(Exception):
+            pass
+        self.client.models.generate_content.side_effect = [ReadTimeout("x"), _resp("ok")]
+        self.assertEqual(logic._generate("p", self.apis[0], self.names[0], "full"), "ok")
+
+    def test_two_network_failures_give_up_with_clear_error(self):
+        self.client.models.generate_content.side_effect = ConnectionError("no route")
+        with self.assertRaises(RuntimeError) as cm:
+            logic._generate("p", self.apis[0], self.names[0], "full")
+        self.assertIn("Нет связи", str(cm.exception))
+        self.assertEqual(self.client.models.generate_content.call_count, 2)
+
+    def test_rejected_http_options_is_disabled(self):
+        self.client.models.generate_content.side_effect = [
+            ValueError("validation error: http_options not permitted"), _resp("ok"),
+        ]
+        self.assertEqual(logic._generate("p", self.apis[0], self.names[0], "title"), "ok")
+        second = self.client.models.generate_content.call_args_list[1].kwargs["config"]
+        self.assertNotIn("http_options", second)
+        self.assertIn("thinking_config", second)       # остальное не отключается
+        self.assertIn("http_options", logic._disabled_options)
 
     def test_rejected_thinking_param_retries_without_it(self):
         # старый SDK: pydantic ValidationError (ValueError) с упоминанием thinking_level
@@ -557,13 +603,13 @@ class TestGenerate(_GenerateBase):
         self.assertIn("thinking_config", calls[0].kwargs["config"])
         self.assertNotIn("thinking_config", calls[1].kwargs["config"])
         self.assertIn("response_mime_type", calls[1].kwargs["config"])   # JSON-режим сохранён
-        self.assertTrue(logic._thinking_disabled)
+        self.assertIn("thinking_config", logic._disabled_options)
 
     def test_unrelated_error_does_not_disable_thinking(self):
         self.client.models.generate_content.side_effect = FakeApiError(400)
         with self.assertRaises(FakeApiError):
             logic._generate("p", self.apis[0], self.names[0], "full")
-        self.assertFalse(logic._thinking_disabled)
+        self.assertEqual(logic._disabled_options, set())
 
     def test_429_switches_to_next_model(self):
         self.client.models.generate_content.side_effect = [
@@ -854,6 +900,14 @@ class TestTranslate(_GenerateBase):
         self.assertIn("<!-- заметка -->", x)
         self.assertIn("var a = 1;", x)
         self.assertIn("Тэкст.", x)
+
+    def test_translation_model_override(self):
+        self.client.models.generate_content.return_value = _resp(json.dumps(BY_OK))
+        with patch.object(logic, "TRANSLATION_MODEL", self.names[-1]):
+            self._translate()
+        self.assertEqual(self.client.models.generate_content.call_args.kwargs["model"],
+                         self.apis[-1])
+        self.assertEqual(logic.get_today_usage(), {self.names[-1]: 1})
 
     def test_defaults_to_first_model(self):
         self.client.models.generate_content.return_value = _resp(json.dumps(BY_OK))

@@ -1227,6 +1227,10 @@ def _setup_logging():
             logging.FileHandler(f"{DATA_DIR}/app.log", encoding="utf-8"),
         ],
     )
+    # Библиотеки пишут на каждый запрос служебные строки (AFC, HTTP Request) — прячем,
+    # свои строки с временем и ошибками логирует core.logic.
+    for noisy in ("google_genai", "httpx", "httpx2", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def main():

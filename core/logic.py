@@ -24,7 +24,7 @@ from google import genai
 from core.config import (
     SECRET_TOKEN, BITRIX_API_URL, GEMINI_API_KEY,
     LOG_FILE, REQUESTS_LOG, DAILY_LIMIT, DAILY_LIMITS, PREVIEW_MAX_LEN, DRAFT_FILE,
-    MODELS, THINKING_LEVEL, TRANSLATION_GLOSSARY,
+    MODELS, REQUEST_TIMEOUT, THINKING_LEVEL, TRANSLATION_GLOSSARY, TRANSLATION_MODEL,
 )
 
 log = logging.getLogger(__name__)
@@ -355,9 +355,11 @@ def fetch_posts(urls: list[str]) -> MergedPost:
 
 _RETRYABLE_CODES = (429, 500, 502, 503, 504)
 
-# Если SDK или модель не принимает thinking_level — отключаем этот параметр до
-# конца работы программы (запросы идут с размышлениями по умолчанию, но не падают).
-_thinking_disabled = False
+# Необязательные параметры запроса, которые старый SDK или модель могут не принять.
+# Если ошибка упоминает такой параметр — отключаем его до конца работы программы
+# (запросы идут без него, но не падают).
+_disabled_options: set[str] = set()
+_OPTION_KEYWORDS = {"thinking_config": "thinking", "http_options": "http_options"}
 
 
 def _parse_json(raw: str) -> dict:
@@ -376,65 +378,93 @@ def _parse_json(raw: str) -> dict:
     return data
 
 
-def _build_config(json_mode: bool) -> dict:
+def _build_config(json_mode: bool, request_type: str) -> dict:
     cfg: dict = {}
     if json_mode:
         cfg["response_mime_type"] = "application/json"
-    if THINKING_LEVEL and not _thinking_disabled:
+    if THINKING_LEVEL and "thinking_config" not in _disabled_options:
         cfg["thinking_config"] = {"thinking_level": THINKING_LEVEL}
+    if REQUEST_TIMEOUT and "http_options" not in _disabled_options:
+        factor = 2 if request_type == "full" else 1
+        cfg["http_options"] = {"timeout": int(REQUEST_TIMEOUT * factor * 1000)}   # в мс
     return cfg
+
+
+def _is_network_error(exc: Exception) -> bool:
+    """Таймаут, обрыв или сбой соединения (httpx/httpcore/сокеты) — не ответ API."""
+    module = type(exc).__module__ or ""
+    return (
+        module.startswith(("httpx", "httpcore", "ssl", "socket"))
+        or isinstance(exc, (TimeoutError, ConnectionError))
+        or "Timeout" in type(exc).__name__
+    )
 
 
 def _generate(prompt: str, model_api: str, model_name: str,
               request_type: str, json_mode: bool = False) -> str:
     """
-    Вызывает Gemini. Если выбранная модель ответила 429 (лимит) или 5xx — после
-    одного повтора при 5xx переходит на следующую модель из MODELS. Модели, у которых
-    исчерпан локальный дневной лимит, пропускаются. Запрос пишется в лог под именем
-    той модели, которая реально ответила. Время и число токенов каждого запроса
-    пишутся в лог (data/app.log) — по ним видно, на что уходит время.
+    Вызывает Gemini.
+    - 429 (лимит модели): сразу переходит на следующую модель из MODELS;
+    - 5xx и сетевые сбои/таймауты: один повтор на той же модели, потом следующая модель;
+      после двух сетевых сбоев подряд сдаётся с понятной ошибкой;
+    - модели с исчерпанным локальным дневным лимитом пропускаются.
+    Запрос пишется в лог под именем модели, которая реально ответила. Время и токены
+    каждого запроса, а также все сбои пишутся в лог (data/app.log).
     """
-    global _thinking_disabled
-
     candidates = [(model_name, model_api)] + [
         (n, a) for n, a in MODELS.items() if a != model_api
     ]
 
     last_exc: Exception | None = None
+    net_failures = 0
     for name, api in candidates:
         if not check_limit(name)[0]:
             log.info("Пропускаю %s: локальный дневной лимит исчерпан", name)
             continue
         attempt = 0
         while attempt < 2:
-            cfg = _build_config(json_mode)
+            cfg = _build_config(json_mode, request_type)
             kwargs = {"config": cfg} if cfg else {}
             started = time.monotonic()
             try:
                 response = client.models.generate_content(
                     model=api, contents=prompt, **kwargs)
             except Exception as exc:
+                elapsed = time.monotonic() - started
                 last_exc = exc
                 code = getattr(exc, "code", None)
-                if code in _RETRYABLE_CODES:
+                network = _is_network_error(exc)
+                if code in _RETRYABLE_CODES or network:
+                    log.warning("%s [%s]: %s %s после %.1f с: %s", name, request_type,
+                                "сбой сети" if network else "ошибка API",
+                                code or type(exc).__name__, elapsed, exc)
+                    if network:
+                        net_failures += 1
+                        if net_failures >= 2:
+                            raise RuntimeError(
+                                "Нет связи с Gemini API (запрос завис или оборвался "
+                                f"дважды подряд): {exc}") from exc
                     if code != 429 and attempt == 0:
                         attempt += 1
                         time.sleep(2)
                         continue
-                    log.warning("%s: ошибка %s — перехожу на следующую модель", name, code)
-                    break
-                if "thinking_config" in cfg and "thinking" in str(exc).lower():
-                    # Старый SDK или модель не знает thinking_level: пробуем без него.
+                    break          # следующая модель
+                disabled = next(
+                    (opt for opt, kw in _OPTION_KEYWORDS.items()
+                     if opt in cfg and kw in str(exc).lower()), None)
+                if disabled:
                     log.warning(
-                        "Параметр thinking_level не принят (%s: %s). Отключаю его; "
+                        "Параметр %s не принят (%s: %s). Отключаю его; "
                         "обновите SDK: pip install -U google-genai",
-                        type(exc).__name__, exc)
-                    _thinking_disabled = True
+                        disabled, type(exc).__name__, exc)
+                    _disabled_options.add(disabled)
                     continue
+                log.error("%s [%s]: %s после %.1f с: %s", name, request_type,
+                          type(exc).__name__, elapsed, exc)
                 raise
             elapsed = time.monotonic() - started
             usage = getattr(response, "usage_metadata", None)
-            log.info("Gemini %s [%s]: %.1f с (вход %s, мысли %s, ответ %s ток.)",
+            log.info("Запрос к %s [%s]: %.1f с (вход %s, мысли %s, ответ %s ток.)",
                      name, request_type, elapsed,
                      getattr(usage, "prompt_token_count", "?"),
                      getattr(usage, "thoughts_token_count", "?"),
@@ -769,7 +799,9 @@ def translate_to_belarusian(title: str, preview: str, html_text: str,
                              model_api: str | None = None,
                              model_name: str | None = None) -> tuple[str, str, str]:
     """Переводит новость на белорусский одним запросом к ИИ. Возвращает (title, preview, text)."""
-    if not model_api or not model_name:
+    if TRANSLATION_MODEL in MODELS:
+        model_name, model_api = TRANSLATION_MODEL, MODELS[TRANSLATION_MODEL]
+    elif not model_api or not model_name:
         model_name, model_api = next(iter(MODELS.items()))
 
     parts, idx = _split_html(html_text)
