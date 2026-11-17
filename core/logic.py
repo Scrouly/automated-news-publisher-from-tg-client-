@@ -385,7 +385,7 @@ def _build_config(json_mode: bool, request_type: str) -> dict:
     if THINKING_LEVEL and "thinking_config" not in _disabled_options:
         cfg["thinking_config"] = {"thinking_level": THINKING_LEVEL}
     if REQUEST_TIMEOUT and "http_options" not in _disabled_options:
-        factor = 2 if request_type == "full" else 1
+        factor = 1.5 if request_type == "full" else 1
         cfg["http_options"] = {"timeout": int(REQUEST_TIMEOUT * factor * 1000)}   # в мс
     return cfg
 
@@ -400,24 +400,43 @@ def _is_network_error(exc: Exception) -> bool:
     )
 
 
+# «Отдых» модели после сбоя: пока он не истёк, запросы идут сначала на другие модели.
+# Бесплатные модели часто перегружены (503 «high demand»), и повторять запрос туда
+# бессмысленно: в логе был случай, когда повтор висел 88 секунд и закончился 504.
+_cooldown: dict[str, float] = {}
+COOLDOWN_RATE_LIMIT = 60     # 429 — лимит запросов в минуту, скоро пройдёт
+COOLDOWN_OVERLOAD   = 300    # 500/502/503/504 — модель перегружена или недоступна
+
+
+def _ordered_candidates(model_name: str, model_api: str) -> list[tuple[str, str]]:
+    """Сначала выбранная модель и резервные, а «отдыхающие» — в самом конце, на крайний случай."""
+    cands = [(model_name, model_api)] + [
+        (n, a) for n, a in MODELS.items() if a != model_api
+    ]
+    now = time.monotonic()
+    ready   = [c for c in cands if _cooldown.get(c[0], 0) <= now]
+    resting = [c for c in cands if c not in ready]
+    for name, _ in resting:
+        log.info("%s недавно сбоила — сначала пробую другие модели", name)
+    return ready + resting
+
+
 def _generate(prompt: str, model_api: str, model_name: str,
               request_type: str, json_mode: bool = False) -> str:
     """
     Вызывает Gemini.
-    - 429 (лимит модели): сразу переходит на следующую модель из MODELS;
-    - 5xx и сетевые сбои/таймауты: один повтор на той же модели, потом следующая модель;
-      после двух сетевых сбоев подряд сдаётся с понятной ошибкой;
+    - 429 (лимит), 503 (перегрузка), 504 (таймаут на стороне Google): сразу следующая
+      модель из MODELS, а сбойная «отдыхает» (_cooldown) — повтор туда только зря
+      тратит время;
+    - 500/502 и сетевые сбои/таймауты: один повтор на той же модели; после двух сетевых
+      сбоев подряд — понятная ошибка «Нет связи»;
     - модели с исчерпанным локальным дневным лимитом пропускаются.
     Запрос пишется в лог под именем модели, которая реально ответила. Время и токены
     каждого запроса, а также все сбои пишутся в лог (data/app.log).
     """
-    candidates = [(model_name, model_api)] + [
-        (n, a) for n, a in MODELS.items() if a != model_api
-    ]
-
     last_exc: Exception | None = None
     net_failures = 0
-    for name, api in candidates:
+    for name, api in _ordered_candidates(model_name, model_api):
         if not check_limit(name)[0]:
             log.info("Пропускаю %s: локальный дневной лимит исчерпан", name)
             continue
@@ -444,10 +463,12 @@ def _generate(prompt: str, model_api: str, model_name: str,
                             raise RuntimeError(
                                 "Нет связи с Gemini API (запрос завис или оборвался "
                                 f"дважды подряд): {exc}") from exc
-                    if code != 429 and attempt == 0:
+                    if (network or code in (500, 502)) and attempt == 0:
                         attempt += 1
                         time.sleep(2)
                         continue
+                    _cooldown[name] = time.monotonic() + (
+                        COOLDOWN_RATE_LIMIT if code == 429 else COOLDOWN_OVERLOAD)
                     break          # следующая модель
                 disabled = next(
                     (opt for opt, kw in _OPTION_KEYWORDS.items()
@@ -469,6 +490,7 @@ def _generate(prompt: str, model_api: str, model_name: str,
                      getattr(usage, "prompt_token_count", "?"),
                      getattr(usage, "thoughts_token_count", "?"),
                      getattr(usage, "candidates_token_count", "?"))
+            _cooldown.pop(name, None)
             log_request(name, request_type)
             text = getattr(response, "text", None)
             if not text or not text.strip():
@@ -769,20 +791,33 @@ def _split_html(html: str) -> tuple[list[str], list[int]]:
     return parts, idx
 
 
-def _looks_belarusian(text: str) -> bool:
+def _russian_words(text: str) -> tuple[int, int]:
     """
-    В белорусском алфавите нет букв «и», «щ», «ъ». Если их заметная доля среди
-    кириллицы — ИИ, скорее всего, вернул русский текст. Короткие тексты не проверяем.
+    (слов с буквами «и», «щ», «ъ», всего кириллических слов). В белорусском алфавите
+    этих букв нет, поэтому каждое такое слово в переводе — русское (или иностранное имя).
     """
     plain = re.sub(r'<[^>]+>', ' ', text or '').lower()
-    letters = re.findall(r'[а-яёіў]', plain)
-    if len(letters) < 150:
-        return True
-    foreign = sum(1 for ch in letters if ch in 'ищъ')
-    return foreign / len(letters) <= 0.02
+    words = re.findall(r'[а-яёіў\'’-]+', plain)
+    return sum(1 for w in words if re.search(r'[ищъ]', w)), len(words)
 
 
-def _fragments_problem(src: list[str], out) -> str | None:
+def _looks_belarusian(text: str) -> bool:
+    """
+    Текст считается русским, если слов с «и/щ/ъ» не меньше трёх и не меньше 2% от всех.
+    Так пропускается пара русских слов в кавычках («Единый день»), но ловится
+    непереведённое предложение — раньше такой текст мог проскочить.
+    """
+    flagged, total = _russian_words(text)
+    return not (flagged >= 3 and flagged / max(total, 1) >= 0.02)
+
+
+def _short_looks_belarusian(text: str) -> bool:
+    """Для заголовка и анонса (коротких): два русских слова и больше 15% — это русский."""
+    flagged, total = _russian_words(text)
+    return not (flagged >= 2 and flagged / max(total, 1) >= 0.15)
+
+
+def _fragments_problem(src: list[str], out, title: str = "", preview: str = "") -> str | None:
     if not isinstance(out, list) or not all(isinstance(x, str) for x in out):
         return "поле fragments должно быть списком строк"
     if len(out) != len(src):
@@ -792,6 +827,8 @@ def _fragments_problem(src: list[str], out) -> str | None:
         return "среди fragments есть пустые элементы: переведи каждый фрагмент"
     if not _looks_belarusian(" ".join(out)):
         return "в тексте остались русские слова (буквы «и», «щ», «ъ»): переведи ВСЁ на белорусский"
+    if not _short_looks_belarusian(title) or not _short_looks_belarusian(preview):
+        return "заголовок или анонс остались на русском: переведи ВСЁ на белорусский"
     return None
 
 
@@ -831,7 +868,7 @@ def translate_to_belarusian(title: str, preview: str, html_text: str,
         if not t_by:
             problem = "пустой заголовок в ответе"
         else:
-            problem = _fragments_problem(src, frags) or ""
+            problem = _fragments_problem(src, frags, t_by, p_by) or ""
         if not problem:
             out_parts = list(parts)
             for i, new in zip(idx, frags):

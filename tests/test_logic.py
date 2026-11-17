@@ -507,9 +507,11 @@ class _GenerateBase(unittest.TestCase):
         self.names = list(logic.MODELS.keys())
         self.apis  = list(logic.MODELS.values())
         logic._disabled_options.clear()
+        logic._cooldown.clear()
 
     def tearDown(self):
         logic._disabled_options.clear()
+        logic._cooldown.clear()
         self._patch_client.stop()
         self._patch_sleep.stop()
         logic.REQUESTS_LOG = self._orig_req
@@ -552,14 +554,14 @@ class TestGenerate(_GenerateBase):
             logic._generate("p", self.apis[0], self.names[0], "title")
         self.assertNotIn("config", self.client.models.generate_content.call_args.kwargs)
 
-    def test_timeout_passed_in_ms_and_doubled_for_full(self):
+    def test_timeout_passed_in_ms_and_one_and_half_for_full(self):
         self.client.models.generate_content.return_value = _resp("ok")
         with patch.object(logic, "REQUEST_TIMEOUT", 40):
             logic._generate("p", self.apis[0], self.names[0], "translate")
             logic._generate("p", self.apis[0], self.names[0], "full")
         calls = self.client.models.generate_content.call_args_list
         self.assertEqual(calls[0].kwargs["config"]["http_options"]["timeout"], 40000)
-        self.assertEqual(calls[1].kwargs["config"]["http_options"]["timeout"], 80000)
+        self.assertEqual(calls[1].kwargs["config"]["http_options"]["timeout"], 60000)
 
     def test_hung_request_is_retried_on_same_model(self):
         self.client.models.generate_content.side_effect = [TimeoutError("hung"), _resp("ok")]
@@ -622,11 +624,72 @@ class TestGenerate(_GenerateBase):
         # в лог попала модель, которая реально ответила
         self.assertEqual(logic.get_today_usage(), {self.names[1]: 1})
 
-    def test_503_retries_same_model_once(self):
+    def test_503_overload_goes_straight_to_next_model(self):
+        # «high demand»: повтор на той же модели только тратит время (в логе — 88 с и 504)
         self.client.models.generate_content.side_effect = [FakeApiError(503), _resp("ok")]
         self.assertEqual(logic._generate("p", self.apis[0], self.names[0], "full"), "ok")
         used = [c.kwargs["model"] for c in self.client.models.generate_content.call_args_list]
+        self.assertEqual(used, [self.apis[0], self.apis[1]])
+
+    def test_504_deadline_goes_straight_to_next_model(self):
+        self.client.models.generate_content.side_effect = [FakeApiError(504), _resp("ok")]
+        logic._generate("p", self.apis[0], self.names[0], "full")
+        used = [c.kwargs["model"] for c in self.client.models.generate_content.call_args_list]
+        self.assertEqual(used, [self.apis[0], self.apis[1]])
+
+    def test_500_retries_same_model_once(self):
+        self.client.models.generate_content.side_effect = [FakeApiError(500), _resp("ok")]
+        self.assertEqual(logic._generate("p", self.apis[0], self.names[0], "full"), "ok")
+        used = [c.kwargs["model"] for c in self.client.models.generate_content.call_args_list]
         self.assertEqual(used, [self.apis[0], self.apis[0]])
+
+    def test_failed_model_rests_for_next_requests(self):
+        self.client.models.generate_content.side_effect = [FakeApiError(503), _resp("a")]
+        logic._generate("p", self.apis[0], self.names[0], "full")
+        self.client.models.generate_content.reset_mock()
+        self.client.models.generate_content.side_effect = None
+        self.client.models.generate_content.return_value = _resp("b")
+        logic._generate("p", self.apis[0], self.names[0], "translate")
+        # второй запрос сразу идёт на модель, которая ответила, а не на сбойную
+        self.assertEqual(self.client.models.generate_content.call_args.kwargs["model"],
+                         self.apis[1])
+        self.assertEqual(self.client.models.generate_content.call_count, 1)
+
+    def test_rest_expires(self):
+        logic._cooldown[self.names[0]] = 0          # срок отдыха давно прошёл
+        self.client.models.generate_content.return_value = _resp("ok")
+        logic._generate("p", self.apis[0], self.names[0], "full")
+        self.assertEqual(self.client.models.generate_content.call_args.kwargs["model"],
+                         self.apis[0])
+
+    def test_all_models_resting_are_still_tried(self):
+        for name in self.names:
+            logic._cooldown[name] = logic.time.monotonic() + 1000
+        self.client.models.generate_content.return_value = _resp("ok")
+        self.assertEqual(logic._generate("p", self.apis[0], self.names[0], "full"), "ok")
+        self.assertEqual(self.client.models.generate_content.call_args.kwargs["model"],
+                         self.apis[0])
+
+    def test_success_clears_rest(self):
+        logic._cooldown[self.names[0]] = logic.time.monotonic() + 1000
+        self.client.models.generate_content.return_value = _resp("ok")
+        # единственная «неотдыхающая» модель сбоит -> пробуем отдыхающую выбранную и она отвечает
+        self.client.models.generate_content.side_effect = (
+            [FakeApiError(503)] * (len(self.apis) - 1) + [_resp("ok")])
+        logic._generate("p", self.apis[0], self.names[0], "full")
+        self.assertNotIn(self.names[0], logic._cooldown)
+
+    def test_rate_limit_rest_is_shorter_than_overload_rest(self):
+        self.client.models.generate_content.side_effect = [FakeApiError(429), _resp("ok")]
+        t0 = logic.time.monotonic()
+        logic._generate("p", self.apis[0], self.names[0], "full")
+        rest429 = logic._cooldown[self.names[0]] - t0
+        self.client.models.generate_content.side_effect = [FakeApiError(503), _resp("ok")]
+        logic._cooldown.clear()
+        t0 = logic.time.monotonic()
+        logic._generate("p", self.apis[0], self.names[0], "full")
+        rest503 = logic._cooldown[self.names[0]] - t0
+        self.assertLess(rest429, rest503)
 
     def test_all_models_429_raises_runtime_error(self):
         self.client.models.generate_content.side_effect = FakeApiError(429)
@@ -929,8 +992,17 @@ class TestBelarusianCheck(unittest.TestCase):
     def test_belarusian_passes(self):
         self.assertTrue(logic._looks_belarusian(self.BY_LONG))
 
-    def test_short_text_not_checked(self):
-        self.assertTrue(logic._looks_belarusian("Работники приняли участие."))
+    def test_one_untranslated_sentence_is_caught(self):
+        # раньше такой текст проскакивал: русская доля букв была ниже порога
+        mixed = self.BY_LONG + " Работники предприятия приняли участие в празднике."
+        self.assertFalse(logic._looks_belarusian(mixed))
+
+    def test_quoted_russian_name_does_not_fail_long_text(self):
+        text = self.BY_LONG * 2 + " Мерапрыемства «Единый день информирования»."
+        self.assertTrue(logic._looks_belarusian(text))
+
+    def test_two_russian_words_pass(self):
+        self.assertTrue(logic._looks_belarusian("Работники приняли."))
 
     def test_tags_are_ignored(self):
         self.assertTrue(logic._looks_belarusian(
@@ -940,6 +1012,17 @@ class TestBelarusianCheck(unittest.TestCase):
         src = ["а"] * 3
         out = [self.RU_LONG, self.RU_LONG, self.RU_LONG]
         self.assertIsNotNone(logic._fragments_problem(src, out))
+
+    def test_untranslated_title_rejected(self):
+        problem = logic._fragments_problem(
+            ["а"], ["Работнікі прынялі ўдзел."], title="Работники почтили память героев.")
+        self.assertIsNotNone(problem)
+        self.assertIn("заголовок", problem)
+
+    def test_belarusian_title_and_preview_pass(self):
+        self.assertIsNone(logic._fragments_problem(
+            ["а"], ["Работнікі прынялі ўдзел."],
+            title="Работнікі ААТ «Даламіт» ўшанавалі памяць.", preview="Падрабязнасці ўнутры."))
 
     def test_fragments_must_be_list_of_strings(self):
         self.assertIsNotNone(logic._fragments_problem(["а"], "строка"))
