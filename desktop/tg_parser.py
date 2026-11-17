@@ -1,7 +1,7 @@
 """
 CLI-обёртка для публикации поста из Telegram.
-Вся бизнес-логика находится в logic.py.
-Использование: python tg_parser.py
+Вся бизнес-логика находится в core/logic.py.
+Использование из корня проекта: python -m desktop.tg_parser
 """
 
 import asyncio
@@ -15,8 +15,8 @@ from datetime import datetime
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-from core.config import SECRET_TOKEN, BITRIX_API_URL, PREVIEW_MAX_LEN
-from core.logic import (
+from core.config import SECRET_TOKEN, BITRIX_API_URL, PREVIEW_MAX_LEN, MODELS  # noqa: E402
+from core.logic import (  # noqa: E402
     clean_tg_url, check_duplicate, log_publication,
     fetch_post_data, enhance_with_ai, inject_font_size,
 )
@@ -29,9 +29,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Модель по умолчанию для CLI
-_CLI_MODEL_API  = "gemini-2.5-flash"
-_CLI_MODEL_NAME = "Gemini 2.5 Flash"
+# Модель по умолчанию для CLI — первая в списке MODELS (core/config.py)
+_CLI_MODEL_NAME, _CLI_MODEL_API = next(iter(MODELS.items()))
 
 
 # ─────────────────────────────────────────────
@@ -89,7 +88,7 @@ def confirm_and_edit(title: str, preview: str) -> tuple[str, str] | None:
                     log.warning("Анонс обрезан до %d символов.", PREVIEW_MAX_LEN)
                     new_preview = new_preview[:PREVIEW_MAX_LEN].rsplit(' ', 1)[0] + '...'
                 preview = new_preview
-            print(f"\n✏️  Обновлено:")
+            print("\n✏️  Обновлено:")
             print(f"  Заголовок : {title}")
             print(f"  Анонс     : {preview}")
         else:
@@ -132,7 +131,7 @@ def process_telegram_post(tg_url: str):
 
     try:
         title, preview, html_text = enhance_with_ai(post_text, _CLI_MODEL_API, _CLI_MODEL_NAME)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         log.error("Ошибка ИИ: %s", e)
         return
 
@@ -177,7 +176,7 @@ def process_telegram_post(tg_url: str):
             log.error("Ошибка Битрикса: %s", api_result.get('msg'))
     except requests.RequestException as e:
         log.error("Сбой соединения с сайтом: %s", e)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         log.error("Неожиданная ошибка: %s", e)
 
 
