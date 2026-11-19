@@ -5,6 +5,7 @@
 
 import io
 import logging
+import os
 import threading
 import time
 import tkinter as tk
@@ -12,10 +13,10 @@ from datetime import datetime
 from tkinter import messagebox, ttk
 
 import requests
-from PIL import Image, ImageTk
+from PIL import Image, ImageOps, ImageTk
 
-from core.config import C, DATA_DIR, MODELS, PREVIEW_MAX_LEN
-from desktop.dialogs import PhotoPickerDialog, HistoryDialog
+from core.config import C, DATA_DIR, MODELS, PREVIEW_MAX_LEN, UPLOAD_LOCAL_IMAGES
+from desktop.dialogs import ImageManagerDialog, HistoryDialog
 from core.logic import (
     parse_tg_urls, find_duplicates, log_publication,
     fetch_posts, enhance_with_ai, inject_font_size,
@@ -79,14 +80,18 @@ class PhotoPreview(tk.Frame):
         self._ph.place(relx=0.5, rely=0.5, anchor="center")
         self._img = tk.Label(self, bg=C["surface2"], bd=0)
 
-    def set_url(self, url):
+    def set_source(self, src):
+        """src — ссылка на изображение или путь к файлу на диске."""
         self._ph.config(text="⏳ Загрузка...", fg=C["accent"])
-        threading.Thread(target=self._load, args=(url,), daemon=True).start()
+        threading.Thread(target=self._load, args=(src,), daemon=True).start()
 
-    def _load(self, url):
+    def _load(self, src):
         try:
-            r   = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-            img = Image.open(io.BytesIO(r.content)).convert("RGB")
+            if os.path.isfile(src):
+                img = ImageOps.exif_transpose(Image.open(src)).convert("RGB")
+            else:
+                r   = requests.get(src, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                img = Image.open(io.BytesIO(r.content)).convert("RGB")
             w, h = img.size
             tr   = self.W / self.H
             if abs(w / h - tr) > 0.02:
@@ -167,8 +172,8 @@ class App(tk.Tk):
         self.minsize(960, 880)
 
         # Состояние
-        self._image_urls        = []
-        self._preview_image_url = None
+        self._images            = []     # [{"src": ссылка или путь к файлу, "kind": "url"|"file"}]
+        self._preview_src       = None   # src анонсового фото
         self._tg_urls           = []     # ссылки на посты, из которых собрана новость
         self._post_text         = ""     # исходный текст постов (для перегенерации)
         self._cancel_event      = threading.Event()   # отмена текущего запроса
@@ -397,7 +402,7 @@ class App(tk.Tk):
                                     font=("Segoe UI", 9), bg=C["bg"], fg=C["text_dim"],
                                     wraplength=240, justify="center")
         self._photo_lbl.pack(pady=(6, 8))
-        self._photo_btn = RoundedButton(rgt, "🖼  Выбрать фото", self._on_pick_photo,
+        self._photo_btn = RoundedButton(rgt, "🖼  Изображения…", self._on_manage_images,
                                          width=200, height=36, bg=C["surface2"],
                                          hover_bg=C["border"], font_size=10, canvas_bg=C["bg"])
         self._photo_btn.pack()
@@ -534,8 +539,10 @@ class App(tk.Tk):
         urls = draft.get("tg_urls") or ([draft["tg_url"]] if draft.get("tg_url") else [])
         self._tg_urls           = list(urls)
         self._post_text         = draft.get("post_text", "")
-        self._image_urls        = draft.get("image_urls", [])
-        self._preview_image_url = draft.get("preview_image_url")
+        self._images            = self._images_from_draft(draft)
+        self._preview_src       = draft.get("preview_src") or draft.get("preview_image_url")
+        if self._preview_src not in {i["src"] for i in self._images}:
+            self._preview_src = self._images[0]["src"] if self._images else None
         self._data              = _empty_data()
         for lang in ("ru", "by"):
             self._data[lang].update(draft.get("data", {}).get(lang, {}))
@@ -555,14 +562,7 @@ class App(tk.Tk):
         self._load_lang("ru")
         self._update_tab_style()
 
-        if self._preview_image_url:
-            idx = (self._image_urls.index(self._preview_image_url) + 1
-                   if self._preview_image_url in self._image_urls else 1)
-            self._photo_lbl.config(
-                text=f"Фото №{idx}  (доступно: {len(self._image_urls)})",
-                fg=C["success"],
-            )
-            self._photo_preview.set_url(self._preview_image_url)
+        self._refresh_photo_ui()
 
         if self._data["by"]["title"]:
             if self._translation_fresh:
@@ -581,8 +581,8 @@ class App(tk.Tk):
         save_draft({
             "tg_urls":           self._tg_urls,
             "post_text":         self._post_text,
-            "image_urls":        self._image_urls,
-            "preview_image_url": self._preview_image_url,
+            "images":            self._images,
+            "preview_src":       self._preview_src,
             "active_from":       self._active_entry.get(),
             "translation_fresh": self._translation_fresh,
             "by_edited":         self._by_edited,
@@ -772,7 +772,7 @@ class App(tk.Tk):
     def _fetch_done(self, merged, title, preview, html):
         self._loading(False)
         self._post_text   = merged.text
-        self._image_urls  = merged.image_urls
+        self._images      = [{"src": u, "kind": "url"} for u in merged.image_urls]
         self._data        = _empty_data()
         self._data["ru"]  = {"title": title, "preview": preview, "text": html}
         self._translation_fresh = False
@@ -804,23 +804,14 @@ class App(tk.Tk):
         if merged.has_video:
             self._warn_video.config(text="⚠  В постах есть видео — оно не будет загружено")
 
-        if self._image_urls:
-            self._preview_image_url = self._image_urls[0]
-            self._photo_lbl.config(
-                text=f"Фото №1  (доступно: {len(self._image_urls)})",
-                fg=C["success"],
-            )
-            self._photo_preview.set_url(self._preview_image_url)
-        else:
-            self._preview_image_url = None
-            self._photo_lbl.config(text="Фотографии не найдены", fg=C["text_dim"])
-            self._photo_preview.clear()
+        self._preview_src = self._images[0]["src"] if self._images else None
+        self._refresh_photo_ui()
 
         self._update_card()
         self._save_draft()
         extra = (f" Постов объединено: {merged.text_posts}." if merged.text_posts > 1 else "")
         took = time.monotonic() - self._fetch_started
-        self._status(f"Готово за {took:.0f} с.{extra} Фото: {len(self._image_urls)}", "success")
+        self._status(f"Готово за {took:.0f} с.{extra} Фото: {len(self._images)}", "success")
 
         if self._publish_by_var.get():
             self._start_translate(title, preview, html)
@@ -1017,26 +1008,49 @@ class App(tk.Tk):
         self._by_status.config(text=f"✗ Ошибка перевода: {msg[:70]}", fg=C["danger"])
 
     # ──────────────────────────────────────────────────────────────
-    #  ВЫБОР ФОТО
+    #  ИЗОБРАЖЕНИЯ
     # ──────────────────────────────────────────────────────────────
 
-    def _on_pick_photo(self):
-        if not self._image_urls:
-            messagebox.showinfo("Фото", "В постах нет фотографий.", parent=self)
-            return
-        dlg = PhotoPickerDialog(self, self._image_urls)
-        self.wait_window(dlg)
-        r = dlg.get_result()
-        if r:
-            self._preview_image_url = r
-            idx = self._image_urls.index(r) + 1
+    @staticmethod
+    def _images_from_draft(draft: dict) -> list:
+        """Изображения из черновика (новый формат — images, старый — image_urls)."""
+        raw = draft.get("images")
+        if raw is None:
+            raw = [{"src": u, "kind": "url"} for u in draft.get("image_urls", [])]
+        result = []
+        for item in raw:
+            if item.get("kind") == "file" and not os.path.isfile(item.get("src", "")):
+                continue          # файл с диска исчез или перенесён
+            result.append({"src": item["src"], "kind": item.get("kind", "url")})
+        return result
+
+    def _refresh_photo_ui(self):
+        """Подпись и превью анонсового фото по текущему состоянию."""
+        srcs = [i["src"] for i in self._images]
+        if self._preview_src in srcs:
+            idx = srcs.index(self._preview_src) + 1
             self._photo_lbl.config(
-                text=f"Фото №{idx}  (доступно: {len(self._image_urls)})",
-                fg=C["success"],
-            )
-            self._photo_preview.set_url(r)
-            self._status(f"Анонсовое фото: №{idx}", "success")
-            self._save_draft()
+                text=f"Анонсовое фото: №{idx}  (всего фото: {len(srcs)})",
+                fg=C["success"])
+            self._photo_preview.set_source(self._preview_src)
+        else:
+            self._preview_src = None
+            self._photo_lbl.config(
+                text="Фотографии не найдены" if not srcs else "Анонсовое фото не выбрано",
+                fg=C["text_dim"])
+            self._photo_preview.clear()
+
+    def _on_manage_images(self):
+        dlg = ImageManagerDialog(self, self._images, self._preview_src,
+                                 allow_local=UPLOAD_LOCAL_IMAGES)
+        self.wait_window(dlg)
+        result = dlg.get_result()
+        if result is None:
+            return
+        self._images, self._preview_src = result
+        self._refresh_photo_ui()
+        self._status(f"Изображения обновлены: {len(self._images)} шт.", "success")
+        self._save_draft()
 
     # ──────────────────────────────────────────────────────────────
     #  ПУБЛИКАЦИЯ
@@ -1054,7 +1068,7 @@ class App(tk.Tk):
 
         # ── Валидация ──────────────────────────────────────────
         issues = validate_publication(
-            ru["title"], ru["preview"], ru["text"], self._preview_image_url, active_from
+            ru["title"], ru["preview"], ru["text"], self._preview_src, active_from
         )
         publish_by = self._publish_by_var.get()
         if publish_by and len(by.get("preview", "")) > PREVIEW_MAX_LEN:
@@ -1109,7 +1123,7 @@ class App(tk.Tk):
             target=self._publish_thread,
             args=(
                 ru["title"], ru["preview"], ru["text"],
-                list(self._image_urls), self._preview_image_url,
+                list(self._images), self._preview_src,
                 active_from,
                 by.get("title", ""), by.get("preview", ""), by.get("text", ""),
                 publish_by, target_section,
@@ -1139,11 +1153,29 @@ class App(tk.Tk):
             elif err_by:
                 parts.append(f"Белорусская версия — ошибка: {err_by}")
 
+            # Файлы с компьютера: сайт должен подтвердить приём (files_saved)
+            files_warn = False
+            sent = result.get("files_sent", 0)
+            if sent:
+                saved = result.get("files_saved")
+                if saved is None:
+                    files_warn = True
+                    parts.append(
+                        f"⚠ Файлов с компьютера отправлено: {sent}, но сайт не подтвердил "
+                        "их приём (в ответе нет files_saved). Проверьте новость на сайте "
+                        "и доработайте обработчик (docs/bitrix_image_files.md).")
+                elif saved < sent:
+                    files_warn = True
+                    parts.append(f"⚠ Сайт сохранил файлов с компьютера: {saved} из {sent}.")
+
             self._status(
-                f"✓  Опубликовано. RU:{id_ru}" + (f"  BY:{id_by}" if id_by else ""),
-                "success",
+                f"✓  Опубликовано. RU:{id_ru}" + (f"  BY:{id_by}" if id_by else "")
+                + ("  ⚠ файлы не подтверждены" if files_warn else ""),
+                "warn" if files_warn else "success",
             )
-            messagebox.showinfo("Успех", "Новость создана!\n\n" + "\n".join(parts), parent=self)
+            show = messagebox.showwarning if files_warn else messagebox.showinfo
+            show("Успех" if not files_warn else "Опубликовано, но проверьте файлы",
+                 "Новость создана!\n\n" + "\n".join(parts), parent=self)
             self._reset()
         else:
             msg = result.get("msg", "Неизвестная ошибка")
@@ -1198,8 +1230,8 @@ class App(tk.Tk):
         self._by_status.config(text="")
         self._sim_lbl.config(text="")
         self._retranslate_btn.set_enabled(True)
-        self._image_urls        = []
-        self._preview_image_url = None
+        self._images            = []
+        self._preview_src       = None
         self._tg_urls           = []
         self._post_text         = ""
         self._tr_seq           += 1     # перевод, который ещё идёт, больше не нужен

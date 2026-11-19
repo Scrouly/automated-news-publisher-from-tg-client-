@@ -1029,5 +1029,170 @@ class TestBelarusianCheck(unittest.TestCase):
         self.assertIsNotNone(logic._fragments_problem(["а"], [1]))
 
 
+# ─────────────────────────────────────────────
+#  Изображения новости: файлы с диска и ссылки
+# ─────────────────────────────────────────────
+
+class TestImages(unittest.TestCase):
+
+    def setUp(self):
+        from PIL import Image
+        self._Image = Image
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make(self, name, size=(300, 200), mode="RGB", fmt=None, exif_orientation=None):
+        path = os.path.join(self.tmp, name)
+        img = self._Image.new(mode, size, (200, 30, 30) if mode == "RGB" else (200, 30, 30, 128))
+        kwargs = {}
+        if exif_orientation:
+            exif = self._Image.Exif()
+            exif[274] = exif_orientation
+            kwargs["exif"] = exif
+        img.save(path, fmt, **kwargs)
+        return path
+
+    def test_thumbnail_from_local_file(self):
+        path = self._make("a.jpg")
+        thumb = logic.load_image_thumbnail(path, size=(120, 80))
+        self.assertEqual(thumb.size, (120, 80))
+
+    def test_thumbnail_of_broken_file_is_none(self):
+        path = os.path.join(self.tmp, "broken.jpg")
+        with open(path, "wb") as f:
+            f.write(b"not an image")
+        self.assertIsNone(logic.load_image_thumbnail(path))
+
+    def test_thumbnail_of_url_uses_download(self):
+        import io
+        buf = io.BytesIO()
+        self._Image.new("RGB", (50, 50)).save(buf, "PNG")
+        resp = MagicMock(content=buf.getvalue())
+        with patch.object(logic.requests, "get", return_value=resp):
+            thumb = logic.load_image_thumbnail("https://example.com/a.png", size=(60, 40))
+        self.assertEqual(thumb.size, (60, 40))
+
+    def test_thumbnail_of_dead_url_is_none(self):
+        import requests
+        with patch.object(logic.requests, "get", side_effect=requests.ConnectionError()), \
+                patch.object(logic.time, "sleep", lambda s: None):
+            self.assertIsNone(logic.load_image_thumbnail("https://example.com/a.png"))
+
+    def test_prepare_resizes_and_converts_to_jpeg(self):
+        import base64
+        import io
+        path = self._make("big photo (1).png", size=(3000, 1500), mode="RGBA", fmt="PNG")
+        with patch.object(logic, "LOCAL_IMAGE_MAX_SIDE", 1000):
+            prepared = logic.prepare_local_image(path)
+        self.assertTrue(prepared["name"].endswith(".jpg"))
+        self.assertNotIn(" ", prepared["name"])
+        img = self._Image.open(io.BytesIO(base64.b64decode(prepared["data"])))
+        self.assertEqual(img.format, "JPEG")
+        self.assertEqual(max(img.size), 1000)
+
+    def test_prepare_respects_exif_orientation(self):
+        import base64
+        import io
+        path = self._make("rot.jpg", size=(200, 100), fmt="JPEG", exif_orientation=6)
+        prepared = logic.prepare_local_image(path)
+        img = self._Image.open(io.BytesIO(base64.b64decode(prepared["data"])))
+        self.assertEqual(img.size, (100, 200))
+
+    def test_split_images_separates_urls_and_files(self):
+        f1 = self._make("a.jpg")
+        images = [{"src": "https://x/1.jpg", "kind": "url"}, {"src": f1, "kind": "file"},
+                  {"src": "https://x/2.jpg", "kind": "url"}]
+        parts = logic.split_images(images, f1)
+        self.assertEqual(parts["image_urls"], ["https://x/1.jpg", "https://x/2.jpg"])
+        self.assertEqual([f["name"] for f in parts["image_files"]], ["a.jpg"])
+        self.assertIsNone(parts["preview_image_url"])
+        self.assertEqual(parts["preview_image_file"], "a.jpg")
+
+    def test_split_images_preview_url(self):
+        parts = logic.split_images(["https://x/1.jpg", "https://x/2.jpg"], "https://x/2.jpg")
+        self.assertEqual(parts["preview_image_url"], "https://x/2.jpg")
+        self.assertIsNone(parts["preview_image_file"])
+
+    def test_same_file_names_get_unique(self):
+        os.makedirs(os.path.join(self.tmp, "d1"))
+        os.makedirs(os.path.join(self.tmp, "d2"))
+        p1 = self._make(os.path.join("d1", "photo.jpg"))
+        p2 = self._make(os.path.join("d2", "photo.jpg"))
+        parts = logic.split_images([p1, p2], p2)
+        names = [f["name"] for f in parts["image_files"]]
+        self.assertEqual(len(set(names)), 2)
+        self.assertEqual(parts["preview_image_file"], names[1])
+
+
+class TestSendToBitrixImages(unittest.TestCase):
+
+    def setUp(self):
+        from PIL import Image
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "a.jpg")
+        Image.new("RGB", (80, 60)).save(self.path)
+        self.resp = MagicMock()
+        self.resp.json.return_value = {"status": "success", "id": 1}
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _send(self, images, preview):
+        with patch.object(logic.requests, "post", return_value=self.resp) as post:
+            logic.send_to_bitrix("З.", "А.", "<p>т</p>", images, preview, "01.02.2026 10:00:00")
+        return post, json.loads(post.call_args.kwargs["data"])
+
+    def test_urls_only_payload_is_as_before(self):
+        post, payload = self._send(
+            [{"src": "https://x/1.jpg", "kind": "url"}], "https://x/1.jpg")
+        self.assertEqual(payload["image_urls"], ["https://x/1.jpg"])
+        self.assertEqual(payload["preview_image_url"], "https://x/1.jpg")
+        self.assertNotIn("image_files", payload)
+        self.assertNotIn("preview_image_file", payload)
+
+    def test_plain_url_strings_are_accepted(self):
+        _, payload = self._send(["https://x/1.jpg"], "https://x/1.jpg")
+        self.assertEqual(payload["image_urls"], ["https://x/1.jpg"])
+
+    def test_local_files_sent_as_base64_when_enabled(self):
+        with patch.object(logic, "UPLOAD_LOCAL_IMAGES", True):
+            _, payload = self._send(
+                [{"src": "https://x/1.jpg", "kind": "url"}, {"src": self.path, "kind": "file"}],
+                self.path)
+        self.assertEqual(payload["image_urls"], ["https://x/1.jpg"])
+        self.assertEqual(payload["image_files"][0]["name"], "a.jpg")
+        self.assertTrue(payload["image_files"][0]["data"])
+        self.assertEqual(payload["preview_image_file"], "a.jpg")
+        self.assertIsNone(payload["preview_image_url"])
+
+    def test_result_tells_how_many_files_were_sent(self):
+        with patch.object(logic, "UPLOAD_LOCAL_IMAGES", True), \
+                patch.object(logic.requests, "post", return_value=self.resp):
+            result = logic.send_to_bitrix(
+                "З.", "А.", "<p>т</p>", [{"src": self.path, "kind": "file"}], self.path,
+                "01.02.2026 10:00:00")
+        self.assertEqual(result["files_sent"], 1)
+
+    def test_result_untouched_without_files(self):
+        with patch.object(logic.requests, "post", return_value=self.resp):
+            result = logic.send_to_bitrix(
+                "З.", "А.", "<p>т</p>", ["https://x/1.jpg"], "https://x/1.jpg",
+                "01.02.2026 10:00:00")
+        self.assertNotIn("files_sent", result)
+
+    def test_local_files_refused_when_disabled(self):
+        with patch.object(logic, "UPLOAD_LOCAL_IMAGES", False), \
+                patch.object(logic.requests, "post") as post:
+            with self.assertRaises(ValueError):
+                logic.send_to_bitrix("З.", "А.", "<p>т</p>",
+                                     [{"src": self.path, "kind": "file"}], self.path,
+                                     "01.02.2026 10:00:00")
+        post.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

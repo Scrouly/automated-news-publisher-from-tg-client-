@@ -3,6 +3,7 @@
 Не содержит ничего связанного с GUI.
 """
 
+import base64
 import csv
 import difflib
 import io
@@ -18,13 +19,14 @@ from datetime import datetime
 from html import escape as _html_escape
 from html import unescape as _html_unescape
 from urllib.parse import urlparse
-from PIL import Image
+from PIL import Image, ImageOps
 from google import genai
 
 from core.config import (
     SECRET_TOKEN, BITRIX_API_URL, GEMINI_API_KEY,
     LOG_FILE, REQUESTS_LOG, DAILY_LIMIT, DAILY_LIMITS, PREVIEW_MAX_LEN, DRAFT_FILE,
     MODELS, REQUEST_TIMEOUT, THINKING_LEVEL, TRANSLATION_GLOSSARY, TRANSLATION_MODEL,
+    UPLOAD_LOCAL_IMAGES, LOCAL_IMAGE_MAX_SIDE, LOCAL_IMAGE_QUALITY,
 )
 
 log = logging.getLogger(__name__)
@@ -728,17 +730,78 @@ def inject_font_size(html_text: str) -> str:
 #  Конвертация в ImageTk выполняется на уровне виджетов.
 # ─────────────────────────────────────────────
 
+def _letterbox(img: Image.Image, size: tuple) -> Image.Image:
+    img = img.convert("RGB")
+    img.thumbnail(size, Image.LANCZOS)
+    thumb = Image.new("RGB", size, (22, 24, 31))
+    thumb.paste(img, ((size[0] - img.width) // 2, (size[1] - img.height) // 2))
+    return thumb
+
+
 def download_image_thumbnail(url: str, size: tuple = (240, 160)) -> Image.Image | None:
     """Скачивает изображение и возвращает PIL.Image с letterbox-паддингом."""
     try:
-        resp  = with_retry(requests.get, url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-        img   = Image.open(io.BytesIO(resp.content)).convert("RGB")
-        img.thumbnail(size, Image.LANCZOS)
-        thumb = Image.new("RGB", size, (22, 24, 31))
-        thumb.paste(img, ((size[0] - img.width) // 2, (size[1] - img.height) // 2))
-        return thumb
+        resp = with_retry(requests.get, url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        return _letterbox(Image.open(io.BytesIO(resp.content)), size)
     except Exception:
         return None
+
+
+def load_image_thumbnail(src: str, size: tuple = (240, 160)) -> Image.Image | None:
+    """Превью изображения: src — путь к файлу на диске или ссылка. None — не удалось открыть."""
+    if os.path.isfile(src):
+        try:
+            return _letterbox(ImageOps.exif_transpose(Image.open(src)), size)
+        except Exception:
+            return None
+    return download_image_thumbnail(src, size)
+
+
+def is_local_image(src: str) -> bool:
+    return os.path.isfile(src)
+
+
+def prepare_local_image(path: str) -> dict:
+    """
+    Готовит файл с диска к отправке на сайт: учитывает поворот из EXIF, уменьшает
+    до LOCAL_IMAGE_MAX_SIDE, сохраняет как JPEG. Возвращает {"name": ..., "data": base64}.
+    """
+    img = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+    img.thumbnail((LOCAL_IMAGE_MAX_SIDE, LOCAL_IMAGE_MAX_SIDE), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=LOCAL_IMAGE_QUALITY, optimize=True)
+    stem = re.sub(r'[^\w.-]+', '_', os.path.splitext(os.path.basename(path))[0]) or "image"
+    return {"name": f"{stem}.jpg", "data": base64.b64encode(buf.getvalue()).decode("ascii")}
+
+
+def split_images(images: list, preview_src: str | None) -> dict:
+    """
+    Разбирает список изображений новости (словари {"src": ...} или просто ссылки) на то,
+    что сайт скачает сам (image_urls), и файлы с диска (image_files).
+    Возвращает ключи: image_urls, preview_image_url, image_files, preview_image_file.
+    """
+    urls: list[str] = []
+    files: list[dict] = []
+    preview_url = preview_file = None
+    used_names: set[str] = set()
+    for item in images:
+        src = item["src"] if isinstance(item, dict) else item
+        if is_local_image(src):
+            prepared = prepare_local_image(src)
+            base, n = prepared["name"][:-4], 2
+            while prepared["name"] in used_names:          # два файла с одним именем
+                prepared["name"] = f"{base}_{n}.jpg"
+                n += 1
+            used_names.add(prepared["name"])
+            files.append(prepared)
+            if src == preview_src:
+                preview_file = prepared["name"]
+        else:
+            urls.append(src)
+            if src == preview_src:
+                preview_url = src
+    return {"image_urls": urls, "preview_image_url": preview_url,
+            "image_files": files, "preview_image_file": preview_file}
 
 
 # ─────────────────────────────────────────────
@@ -889,18 +952,28 @@ def translate_to_belarusian(title: str, preview: str, html_text: str,
 # ─────────────────────────────────────────────
 
 def send_to_bitrix(title: str, preview: str, html_text: str,
-                   image_urls: list, preview_image_url: str | None,
+                   images: list, preview_src: str | None,
                    active_from: str,
                    title_by: str = "", preview_by: str = "",
                    text_by: str = "", publish_by: bool = False,
                    target_section: str = "news") -> dict:
+    """
+    images — список изображений: ссылки или словари {"src": ..., "kind": ...}; src может быть
+    путём к файлу на диске. Ссылки уходят в image_urls (как раньше), файлы — в image_files
+    (base64). Если файлов нет, запрос не отличается от прежнего.
+    """
+    parts = split_images(images, preview_src)
+    if parts["image_files"] and not UPLOAD_LOCAL_IMAGES:
+        raise ValueError(
+            "Отправка файлов с компьютера выключена (UPLOAD_LOCAL_IMAGES в core/config.py): "
+            "сайт должен уметь принимать поле image_files. Замените файлы ссылками.")
     payload = {
         'token':             SECRET_TOKEN,
         'title':             title,
         'preview':           preview,
         'text':              html_text,
-        'image_urls':        image_urls,
-        'preview_image_url': preview_image_url,
+        'image_urls':        parts["image_urls"],
+        'preview_image_url': parts["preview_image_url"],
         'active_from':       active_from,
         'publish_by':        publish_by,
         'title_by':          title_by,
@@ -908,10 +981,17 @@ def send_to_bitrix(title: str, preview: str, html_text: str,
         'text_by':           text_by,
         'target_section':    target_section,
     }
+    if parts["image_files"]:
+        payload['image_files']        = parts["image_files"]
+        payload['preview_image_file'] = parts["preview_image_file"]
     headers = {'Content-Type': 'application/json'}
     resp = with_retry(
         requests.post, BITRIX_API_URL,
         data=json.dumps(payload), headers=headers, timeout=60,
     )
     resp.raise_for_status()
-    return resp.json()
+    result = resp.json()
+    if parts["image_files"] and isinstance(result, dict):
+        # сколько файлов отправлено — приложение сверит с files_saved из ответа сайта
+        result["files_sent"] = len(parts["image_files"])
+    return result
